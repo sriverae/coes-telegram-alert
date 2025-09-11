@@ -151,8 +151,8 @@ def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
     def find_col(pattern):
         return next((c for c in data.columns if re.search(pattern, str(c), re.I)), None)
 
-    col_hora = find_col(r"^hora$")
-    col_barra = find_col(r"^barra$")
+    col_hora = find_col(r"\bhora\b")
+    col_barra = find_col(r"\bbarra\b")
     col_cm_energia = find_col(r"cm\s*energ")
     col_cm_cong   = find_col(r"cm\s*conges")
     col_cm_total  = find_col(r"cm\s*total")
@@ -223,7 +223,15 @@ def obtener_ultimo_costo_por_export(timeout_ms=25000):
             page.get_by_text("Datos", exact=True).click(timeout=5000)
         except Exception:
             pass
-
+            
+        # Hacer clic en "Buscar" para que se carguen los datos antes de exportar
+        try:
+            page.get_by_role("button", name=re.compile(r"^Buscar$", re.I)).click(timeout=8000)
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1500)  # pequeña espera para que se llene la tabla
+        except Exception:
+            pass
+            
         with page.expect_download(timeout=timeout_ms) as download_info:
             page.get_by_text("Exportar", exact=True).click()
         download = download_info.value
