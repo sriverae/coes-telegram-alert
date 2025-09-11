@@ -37,7 +37,7 @@ GIST_FILENAME = os.getenv("GIST_FILENAME", "estado_alerta_chiclayo220.json")
 
 URL_COSTOS_TIEMPO_REAL = os.getenv(
     "URL_COSTOS_TIEMPO_REAL",
-    "https://www.coes.org.pe/Portal/MercadoMayorista/CostosMarginales/Index"
+    "https://www.coes.org.pe/portal/operacion/costosmarginales"
 )
 
 def _parse_hhmm(s: str):
