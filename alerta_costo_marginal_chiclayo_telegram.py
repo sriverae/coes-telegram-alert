@@ -297,59 +297,70 @@ def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
     return df
     
 def leer_tabla_html(html: str) -> pd.DataFrame:
-    """Lee las tablas HTML ya renderizadas (con Playwright) y devuelve un DF estándar."""
-    tablas = pd.read_html(html)
+    """Lee tablas desde HTML renderizado y busca columnas equivalentes (Barra/Nodo/Punto y CM*)."""
+    import io as _io
+
+    # pandas >=2.2 pide StringIO en vez de literal
+    tablas = pd.read_html(_io.StringIO(html))
     if not tablas:
         raise RuntimeError("No se encontraron tablas en HTML.")
 
-    # Buscar una tabla que tenga 'Barra' y alguna de CM*
+    barra_pats = [r"\bbarra\b", r"\bnodo\b", r"\bpunto\b"]
+    cm_total_pats = [r"cm\s*total", r"costo\s*marginal\s*total"]
+    cm_ener_pats  = [r"cm\s*energ", r"costo\s*marginal\s*energ"]
+    cm_cong_pats  = [r"cm\s*conges"]
+
+    def _find_col(cols, pats):
+        for c in cols:
+            s = str(c)
+            if any(re.search(p, s, re.I) for p in pats):
+                return c
+        return None
+
     for t in tablas:
-        cols = [str(c) for c in t.columns]
-        tiene_barra = any(re.search(r"\bbarra\b", c, re.I) for c in cols)
-        tiene_alguna_cm = any(re.search(r"cm\s*(energ|conges|total)", c, re.I) for c in cols)
-        if tiene_barra and tiene_alguna_cm:
-            data = t.copy()
+        data = t.copy()
+        cols = list(data.columns)
 
-            def find_col(pattern):
-                return next((c for c in data.columns if re.search(pattern, str(c), re.I)), None)
+        col_barra = _find_col(cols, barra_pats)
+        col_total = _find_col(cols, cm_total_pats)
+        col_ener  = _find_col(cols, cm_ener_pats)
+        col_cong  = _find_col(cols, cm_cong_pats)
+        col_hora  = _find_col(cols, [r"\bhora\b"])
 
-            col_hora = find_col(r"\bhora\b")
-            col_barra = find_col(r"\bbarra\b")
-            col_cm_energia = find_col(r"cm\s*energ")
-            col_cm_cong   = find_col(r"cm\s*conges")
-            col_cm_total  = find_col(r"cm\s*total")
+        # Debe tener al menos Barra/Nodo/Punto y una de las CM
+        if not col_barra or not (col_total or col_ener or col_cong):
+            continue
 
-            if not (col_barra and (col_cm_total or col_cm_energia or col_cm_cong)):
-                continue
+        keep = [c for c in [col_hora, col_barra, col_ener, col_cong, col_total] if c is not None]
+        df = data[keep].copy()
 
-            keep = [c for c in [col_hora, col_barra, col_cm_energia, col_cm_cong, col_cm_total] if c]
-            df = data[keep].copy()
-            rename_map = {}
-            if col_hora:       rename_map[col_hora] = "Hora"
-            rename_map[col_barra] = "Barra"
-            if col_cm_energia: rename_map[col_cm_energia] = "CM_Energia"
-            if col_cm_cong:    rename_map[col_cm_cong]    = "CM_Congestion"
-            if col_cm_total:   rename_map[col_cm_total]   = "CM_Total"
-            df = df.rename(columns=rename_map)
+        rename_map = {col_barra: "Barra"}
+        if col_hora:  rename_map[col_hora]  = "Hora"
+        if col_ener:  rename_map[col_ener]  = "CM_Energia"
+        if col_cong:  rename_map[col_cong]  = "CM_Congestion"
+        if col_total: rename_map[col_total] = "CM_Total"
+        df = df.rename(columns=rename_map)
 
-            # Números
-            for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
-                if c in df.columns:
-                    df[c] = (
-                        df[c].astype(str)
-                        .str.replace(",", ".", regex=False)
-                        .str.extract(r"([-]?[0-9]+(?:\.[0-9]+)?)")[0]
-                        .astype(float)
-                    )
-            # Hora opcional
-            if "Hora" in df.columns:
-                df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
-            else:
-                # si no hay hora en la tabla, usamos ahora()
-                df["ts"] = pd.Timestamp.now(tz=TZ)
-            return df
+        # Convertir a float
+        for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
+            if c in df.columns:
+                df[c] = (
+                    df[c].astype(str)
+                    .str.replace(",", ".", regex=False)
+                    .str.extract(r"([-]?[0-9]+(?:\.[0-9]+)?)")[0]
+                    .astype(float)
+                )
 
-    raise RuntimeError("No se encontró una tabla HTML con columnas esperadas (Barra/CM).")
+        # Timestamp
+        if "Hora" in df.columns:
+            df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
+        else:
+            df["ts"] = pd.Timestamp.now(tz=TZ)
+
+        return df
+
+    raise RuntimeError("No se encontró una tabla HTML con columnas esperadas (Barra/Nodo y CM).")
+
 
 def _norm_barra(s: str) -> str:
     if s is None:
@@ -417,7 +428,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=30000):
         b = None
         try:
             with page.expect_download(timeout=timeout_ms) as download_info:
-                # "Exportar" o "Exportar Datos"
                 try:
                     page.get_by_text("Exportar", exact=True).click()
                 except Exception:
@@ -435,7 +445,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=30000):
         # Fallback HTML si no hay DF o está vacío
         if df is None or df.empty:
             html = page.content()
-            # (OPCIONAL) guarda para depurar:
+            # (OPCIONAL DEBUG)
             # with open("html_debug.html", "w", encoding="utf-8") as f:
             #     f.write(html)
             df = leer_tabla_html(html)
@@ -456,6 +466,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=30000):
         ts = ts.tz_localize(TZ)
 
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
+
 
 def ejecutar_iteracion():
     estado = cargar_estado()
