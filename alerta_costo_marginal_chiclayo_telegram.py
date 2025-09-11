@@ -59,7 +59,71 @@ def en_horario_sonido(ahora: datetime) -> bool:
         return not (t_desde <= t < t_hasta)
     else:
         return not (t >= t_desde or t < t_hasta)
-        
+
+def _select_last_hour(page):
+    """Selecciona la última hora disponible en el <select> que contiene opciones tipo HH:MM."""
+    selects = page.locator("select")
+    try:
+        n = selects.count()
+    except:
+        n = 0
+    for i in range(n):
+        sel = selects.nth(i)
+        try:
+            options = sel.locator("option")
+            texts = options.all_inner_texts()
+            if any(re.fullmatch(r"\d{1,2}:\d{2}", (t or "").strip()) for t in texts):
+                cnt = options.count()
+                last_val = None
+                for j in range(cnt - 1, -1, -1):
+                    v = options.nth(j).get_attribute("value")
+                    if v and v.strip():
+                        last_val = v
+                        break
+                if last_val:
+                    sel.select_option(last_val)
+                    return True
+        except Exception:
+            pass
+    return False
+
+def _select_filter_barras_138(page):
+    """Intenta seleccionar el filtro 'Barras mayores a 138' (texto flexible)."""
+    selects = page.locator("select")
+    try:
+        n = selects.count()
+    except:
+        n = 0
+    for i in range(n):
+        sel = selects.nth(i)
+        try:
+            opts = sel.locator("option")
+            texts = opts.all_inner_texts()
+            for idx, t in enumerate(texts):
+                if re.search(r"barras\s+mayores?\s+a\s*138", (t or ""), re.I):
+                    val = opts.nth(idx).get_attribute("value")
+                    if val and val.strip():
+                        sel.select_option(val)
+                        return True
+        except Exception:
+            pass
+    return False
+
+def _wait_for_data(page):
+    """Espera a que la tabla de Datos esté cargada antes de exportar."""
+    try:
+        # texto típico de columna
+        page.wait_for_selector("text=CM Total", timeout=8000)
+        return
+    except Exception:
+        pass
+    try:
+        # cualquier tabla visible
+        page.wait_for_selector("table", timeout=8000)
+        page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
 def _select_last_hour(page):
     """Selecciona la última hora disponible en el <select> que contiene opciones tipo HH:MM."""
     selects = page.locator("select")
@@ -231,6 +295,61 @@ def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
             )
     df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
     return df
+    
+def leer_tabla_html(html: str) -> pd.DataFrame:
+    """Lee las tablas HTML ya renderizadas (con Playwright) y devuelve un DF estándar."""
+    tablas = pd.read_html(html)
+    if not tablas:
+        raise RuntimeError("No se encontraron tablas en HTML.")
+
+    # Buscar una tabla que tenga 'Barra' y alguna de CM*
+    for t in tablas:
+        cols = [str(c) for c in t.columns]
+        tiene_barra = any(re.search(r"\bbarra\b", c, re.I) for c in cols)
+        tiene_alguna_cm = any(re.search(r"cm\s*(energ|conges|total)", c, re.I) for c in cols)
+        if tiene_barra and tiene_alguna_cm:
+            data = t.copy()
+
+            def find_col(pattern):
+                return next((c for c in data.columns if re.search(pattern, str(c), re.I)), None)
+
+            col_hora = find_col(r"\bhora\b")
+            col_barra = find_col(r"\bbarra\b")
+            col_cm_energia = find_col(r"cm\s*energ")
+            col_cm_cong   = find_col(r"cm\s*conges")
+            col_cm_total  = find_col(r"cm\s*total")
+
+            if not (col_barra and (col_cm_total or col_cm_energia or col_cm_cong)):
+                continue
+
+            keep = [c for c in [col_hora, col_barra, col_cm_energia, col_cm_cong, col_cm_total] if c]
+            df = data[keep].copy()
+            rename_map = {}
+            if col_hora:       rename_map[col_hora] = "Hora"
+            rename_map[col_barra] = "Barra"
+            if col_cm_energia: rename_map[col_cm_energia] = "CM_Energia"
+            if col_cm_cong:    rename_map[col_cm_cong]    = "CM_Congestion"
+            if col_cm_total:   rename_map[col_cm_total]   = "CM_Total"
+            df = df.rename(columns=rename_map)
+
+            # Números
+            for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
+                if c in df.columns:
+                    df[c] = (
+                        df[c].astype(str)
+                        .str.replace(",", ".", regex=False)
+                        .str.extract(r"([-]?[0-9]+(?:\.[0-9]+)?)")[0]
+                        .astype(float)
+                    )
+            # Hora opcional
+            if "Hora" in df.columns:
+                df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
+            else:
+                # si no hay hora en la tabla, usamos ahora()
+                df["ts"] = pd.Timestamp.now(tz=TZ)
+            return df
+
+    raise RuntimeError("No se encontró una tabla HTML con columnas esperadas (Barra/CM).")
 
 def _norm_barra(s: str) -> str:
     if s is None:
@@ -260,7 +379,7 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
     con220 = candidatos[candidatos["Barra_norm"].str.contains("220", na=False)]
     return con220 if not con220.empty else candidatos
 
-def obtener_ultimo_costo_por_export(timeout_ms=25000):
+def obtener_ultimo_costo_por_export(timeout_ms=30000):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -268,53 +387,62 @@ def obtener_ultimo_costo_por_export(timeout_ms=25000):
 
         # Cerrar aviso si aparece
         try:
-            page.get_by_role("button", name="Aceptar").click(timeout=5000)
+            page.get_by_role("button", name=re.compile(r"Aceptar|OK|Cerrar", re.I)).click(timeout=5000)
         except Exception:
             pass
 
-        # Ir a 'Datos' (si existe esa pestaña/botón)
+        # Ir a 'Datos' (si existe)
         try:
             page.get_by_text("Datos", exact=True).click(timeout=5000)
         except Exception:
             pass
 
-        # Seleccionar filtro y la última hora disponibles (si existen esos selects)
-        try:
-            _select_filter_barras_138(page)
-        except Exception:
-            pass
-        try:
-            _select_last_hour(page)
-        except Exception:
-            pass
+        # Seleccionar filtro y última hora (si existen)
+        try: _select_filter_barras_138(page)
+        except Exception: pass
+        try: _select_last_hour(page)
+        except Exception: pass
 
-        # Click en "Buscar" para que se carguen los datos antes de exportar
+        # Click en "Buscar"
         try:
             page.get_by_role("button", name=re.compile(r"^Buscar$", re.I)).click(timeout=8000)
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(1500)  # pequeña espera extra
         except Exception:
             pass
 
-        # Descargar con 'Exportar'
-        with page.expect_download(timeout=timeout_ms) as download_info:
-            # Si 'Exportar' no es exacto, puedes aflojar: name=re.compile(r"Exportar", re.I)
-            page.get_by_text("Exportar", exact=True).click()
-        download = download_info.value
+        # Esperar a que la tabla esté lista
+        _wait_for_data(page)
 
-        # Binario del Excel
-        if hasattr(download, "create_read_stream"):
-            b = download.create_read_stream().read()
-        else:
-            b = open(download.path(), "rb").read()
+        # Intentar EXPORTAR
+        df = None
+        b = None
+        try:
+            with page.expect_download(timeout=timeout_ms) as download_info:
+                # "Exportar" o "Exportar Datos"
+                try:
+                    page.get_by_text("Exportar", exact=True).click()
+                except Exception:
+                    page.get_by_role("button", name=re.compile(r"Exportar", re.I)).click()
+            download = download_info.value
+            if hasattr(download, "create_read_stream"):
+                b = download.create_read_stream().read()
+            else:
+                b = open(download.path(), "rb").read()
+            # Parsear Excel
+            df = leer_excel_exportado_en_memoria(b)
+        except Exception:
+            df = None
 
-        # (OPCIONAL) Guardar para depurar y subir como artefacto si lo deseas
-        # with open("export_debug.xlsx", "wb") as f:
-        #     f.write(b)
+        # Fallback HTML si no hay DF o está vacío
+        if df is None or df.empty:
+            html = page.content()
+            # (OPCIONAL) guarda para depurar:
+            # with open("html_debug.html", "w", encoding="utf-8") as f:
+            #     f.write(html)
+            df = leer_tabla_html(html)
 
         browser.close()
 
-    df = leer_excel_exportado_en_memoria(b)
+    # Filtrar barra y devolver último
     df = filtrar_barra_robusto(df, BARRA_BUSCADA)
     df = df.sort_values("ts")
     row = df.iloc[-1]
@@ -328,7 +456,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=25000):
         ts = ts.tz_localize(TZ)
 
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
-
 
 def ejecutar_iteracion():
     estado = cargar_estado()
