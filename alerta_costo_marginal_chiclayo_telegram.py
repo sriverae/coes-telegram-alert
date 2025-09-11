@@ -59,6 +59,57 @@ def en_horario_sonido(ahora: datetime) -> bool:
         return not (t_desde <= t < t_hasta)
     else:
         return not (t >= t_desde or t < t_hasta)
+        
+def _select_last_hour(page):
+    """Selecciona la última hora disponible en el <select> que contiene opciones tipo HH:MM."""
+    selects = page.locator("select")
+    try:
+        n = selects.count()
+    except:
+        n = 0
+    for i in range(n):
+        sel = selects.nth(i)
+        try:
+            options = sel.locator("option")
+            texts = options.all_inner_texts()
+            if any(re.fullmatch(r"\d{1,2}:\d{2}", t.strip()) for t in texts):
+                # Elegir la última opción con value no vacío
+                cnt = options.count()
+                last_val = None
+                for j in range(cnt - 1, -1, -1):
+                    v = options.nth(j).get_attribute("value")
+                    if v and v.strip():
+                        last_val = v
+                        break
+                if last_val:
+                    sel.select_option(last_val)
+                    return True
+        except Exception:
+            pass
+    return False
+
+def _select_filter_barras_138(page):
+    """Intenta seleccionar el filtro 'Barras mayores a 138' (texto flexible)."""
+    selects = page.locator("select")
+    try:
+        n = selects.count()
+    except:
+        n = 0
+    for i in range(n):
+        sel = selects.nth(i)
+        try:
+            opts = sel.locator("option")
+            texts = opts.all_inner_texts()
+            for idx, t in enumerate(texts):
+                if re.search(r"barras\s+mayores?\s+a\s*138", t or "", re.I):
+                    val = opts.nth(idx).get_attribute("value")
+                    if val and val.strip():
+                        sel.select_option(val)
+                        return True
+        except Exception:
+            pass
+    return False
+
 
 def _gist_headers():
     return {"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"} if GIST_TOKEN else {}
@@ -215,31 +266,51 @@ def obtener_ultimo_costo_por_export(timeout_ms=25000):
         page = browser.new_page()
         page.goto(URL_COSTOS_TIEMPO_REAL, wait_until="networkidle", timeout=timeout_ms)
 
+        # Cerrar aviso si aparece
         try:
             page.get_by_role("button", name="Aceptar").click(timeout=5000)
         except Exception:
             pass
+
+        # Ir a 'Datos' (si existe esa pestaña/botón)
         try:
             page.get_by_text("Datos", exact=True).click(timeout=5000)
         except Exception:
             pass
-            
-        # Hacer clic en "Buscar" para que se carguen los datos antes de exportar
+
+        # Seleccionar filtro y la última hora disponibles (si existen esos selects)
+        try:
+            _select_filter_barras_138(page)
+        except Exception:
+            pass
+        try:
+            _select_last_hour(page)
+        except Exception:
+            pass
+
+        # Click en "Buscar" para que se carguen los datos antes de exportar
         try:
             page.get_by_role("button", name=re.compile(r"^Buscar$", re.I)).click(timeout=8000)
             page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(1500)  # pequeña espera para que se llene la tabla
+            page.wait_for_timeout(1500)  # pequeña espera extra
         except Exception:
             pass
-            
+
+        # Descargar con 'Exportar'
         with page.expect_download(timeout=timeout_ms) as download_info:
+            # Si 'Exportar' no es exacto, puedes aflojar: name=re.compile(r"Exportar", re.I)
             page.get_by_text("Exportar", exact=True).click()
         download = download_info.value
 
+        # Binario del Excel
         if hasattr(download, "create_read_stream"):
             b = download.create_read_stream().read()
         else:
             b = open(download.path(), "rb").read()
+
+        # (OPCIONAL) Guardar para depurar y subir como artefacto si lo deseas
+        # with open("export_debug.xlsx", "wb") as f:
+        #     f.write(b)
 
         browser.close()
 
@@ -257,6 +328,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=25000):
         ts = ts.tz_localize(TZ)
 
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
+
 
 def ejecutar_iteracion():
     estado = cargar_estado()
