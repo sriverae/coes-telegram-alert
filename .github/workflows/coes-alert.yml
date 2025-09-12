@@ -58,5 +58,6 @@ jobs:
             export_debug.xlsx
             html_main.html
             frame_*.html
+            page_after_buscar.png
           if-no-files-found: ignore
   
