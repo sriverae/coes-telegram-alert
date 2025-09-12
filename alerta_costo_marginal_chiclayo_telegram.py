@@ -38,7 +38,7 @@ GIST_FILENAME = os.getenv("GIST_FILENAME", "estado_alerta_chiclayo220.json")
 
 URL_COSTOS_TIEMPO_REAL = os.getenv(
     "URL_COSTOS_TIEMPO_REAL",
-    "https://www.coes.org.pe/portal/operacion/costosmarginales"
+    "https://www.coes.org.pe/Portal/mercadomayorista/costosmarginales/index"
 )
 
 def _parse_hhmm(s: str):
@@ -615,6 +615,19 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
         page = browser.new_page(viewport={"width": 1366, "height": 900})
         page.goto(URL_COSTOS_TIEMPO_REAL, wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_load_state("networkidle")
+
+        # Si por cualquier razón nos redirigen a Extranet, volver al URL correcto
+        def _on_wrong_site_redirect(page):
+            try:
+                if ("extranet" in page.url.lower() or
+                    page.locator("text=/Acceso al SGO-COES/i").count() > 0):
+                    page.goto("https://www.coes.org.pe/Portal/mercadomayorista/costosmarginales/index",
+                              wait_until="networkidle", timeout=timeout_ms)
+                    page.wait_for_timeout(500)
+            except Exception:
+                pass
+        
+        _on_wrong_site_redirect(page)
 
         # Guarda HTML por si acaso
         try:
