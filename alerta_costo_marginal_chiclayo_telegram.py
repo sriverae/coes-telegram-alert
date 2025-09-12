@@ -61,70 +61,41 @@ def en_horario_sonido(ahora: datetime) -> bool:
         return not (t >= t_desde or t < t_hasta)
         
 def _close_aviso(page):
-    """Cierra el popup 'Aviso' por si bloquea los clics (intenta 'Aceptar' y la 'X')."""
-    try:
-        # botón Aceptar
-        page.get_by_role("button", name=re.compile(r"Aceptar|Aceptar$", re.I)).click(timeout=2000)
-        page.wait_for_timeout(300)
-        return
-    except Exception:
-        pass
-    try:
-        # la 'X' del cuadro
-        page.locator("text=Aviso").locator("xpath=..").locator("xpath=..").locator("button, .close, .btn-close").first.click(timeout=2000)
-        page.wait_for_timeout(300)
-        return
-    except Exception:
-        pass
-
-def _select_last_hour(page):
-    """Selecciona la última hora disponible en el <select> que contiene opciones tipo HH:MM."""
-    selects = page.locator("select")
-    try:
-        n = selects.count()
-    except:
-        n = 0
-    for i in range(n):
-        sel = selects.nth(i)
+    for _ in range(2):
         try:
-            options = sel.locator("option")
-            texts = options.all_inner_texts()
-            if any(re.fullmatch(r"\d{1,2}:\d{2}", (t or "").strip()) for t in texts):
-                cnt = options.count()
-                last_val = None
-                for j in range(cnt - 1, -1, -1):
-                    v = options.nth(j).get_attribute("value")
-                    if v and v.strip():
-                        last_val = v
-                        break
-                if last_val:
-                    sel.select_option(last_val)
-                    return True
+            page.get_by_role("button", name=re.compile(r"Aceptar", re.I)).click(timeout=1500)
+            page.wait_for_timeout(200)
         except Exception:
             pass
-    return False
+        try:
+            page.get_by_text(re.compile(r"Aceptar", re.I)).click(timeout=1500)
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
 
 def _select_filter_barras_138(page):
-    """Intenta seleccionar el filtro 'Barras mayores a 138' (texto flexible)."""
-    selects = page.locator("select")
     try:
-        n = selects.count()
-    except:
-        n = 0
-    for i in range(n):
-        sel = selects.nth(i)
+        # Si es un <select> estándar
+        page.select_option("select", label=re.compile(r"mayores a 138", re.I))
+    except Exception:
+        # Si es un dropdown custom, intenta abrir y elegir
         try:
-            opts = sel.locator("option")
-            texts = opts.all_inner_texts()
-            for idx, t in enumerate(texts):
-                if re.search(r"barras\s+mayores?\s+a\s*138", (t or ""), re.I):
-                    val = opts.nth(idx).get_attribute("value")
-                    if val and val.strip():
-                        sel.select_option(val)
-                        return True
+            page.get_by_role("combobox").click(timeout=1200)
+            page.get_by_role("option", name=re.compile(r"mayores a 138", re.I)).click(timeout=1200)
         except Exception:
             pass
-    return False
+
+def _select_last_hour(page):
+    # Si hay campo hora, intenta seleccionar la última opción
+    try:
+        # Abre el control de hora (input/select)
+        page.get_by_role("combobox", name=re.compile(r"Hora", re.I)).click(timeout=1500)
+        opciones = page.locator("role=option")
+        n = opciones.count()
+        if n > 0:
+            opciones.nth(n-1).click(timeout=1500)
+    except Exception:
+        pass
 
 def _wait_for_data(page):
     """Espera a que la tabla de Datos esté cargada antes de exportar."""
@@ -374,6 +345,46 @@ def leer_tabla_html(html: str) -> pd.DataFrame:
 
     raise RuntimeError("No se encontró una tabla HTML con columnas esperadas (Barra/Nodo y CM).")
 
+def leer_tabla_html_desde_frames(page) -> pd.DataFrame:
+    """
+    Intenta leer la tabla desde el frame principal y, si no, desde todos los iframes.
+    Además deja artefactos de debug: html_main.html y frame_*.html
+    """
+    # Dump del HTML principal para debug
+    try:
+        html_main = page.content()
+        with open("html_main.html", "w", encoding="utf-8") as f:
+            f.write(html_main)
+        # Intento directo en el main
+        try:
+            df = leer_tabla_html(html_main)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Recorrer todos los frames y guardar su HTML
+    found = None
+    for i, fr in enumerate(page.frames):
+        try:
+            h = fr.content()
+            with open(f"frame_{i}.html", "w", encoding="utf-8") as f:
+                f.write(h)
+            try:
+                df = leer_tabla_html(h)
+                if df is not None and not df.empty:
+                    found = df
+                    break
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+    if found is not None:
+        return found
+    raise RuntimeError("No se encontró una tabla de Datos en ninguno de los frames.")
 
 
 def _norm_barra(s: str) -> str:
@@ -411,20 +422,27 @@ def obtener_ultimo_costo_por_export(timeout_ms=35000):
         page.goto(URL_COSTOS_TIEMPO_REAL, wait_until="networkidle", timeout=timeout_ms)
 
         # 1) Cerrar el popup "Aviso" si aparece
-        _close_aviso(page)
+        try:
+            _close_aviso(page)
+        except Exception:
+            pass
 
-        # 2) Ir a 'Datos' (si existe)
+        # 2) Ir a la pestaña "Datos" si existe
         try:
             page.get_by_text("Datos", exact=True).click(timeout=4000)
             page.wait_for_timeout(300)
         except Exception:
             pass
 
-        # 3) Seleccionar filtro y última hora (si existen)
-        try: _select_filter_barras_138(page)
-        except Exception: pass
-        try: _select_last_hour(page)
-        except Exception: pass
+        # 3) Intentar seleccionar filtros/última hora (opcionales)
+        try:
+            _select_filter_barras_138(page)
+        except Exception:
+            pass
+        try:
+            _select_last_hour(page)
+        except Exception:
+            pass
 
         # 4) Buscar
         try:
@@ -432,24 +450,20 @@ def obtener_ultimo_costo_por_export(timeout_ms=35000):
         except Exception:
             pass
 
-        # 5) (de nuevo) forzar pestaña "Datos" después de buscar
+        # 4.1) Si reaparece el aviso, cerrarlo
         try:
-            page.get_by_text("Datos", exact=True).click(timeout=4000)
-            page.wait_for_timeout(500)
+            _close_aviso(page)
         except Exception:
             pass
 
-        # 6) Esperar a que aparezca una tabla o encabezados típicos
+        # 5) Asegurar pestaña "Datos"
         try:
-            page.wait_for_selector("text=CM Total", timeout=7000)
+            page.get_by_text("Datos", exact=True).click(timeout=4000)
+            page.wait_for_timeout(600)
         except Exception:
-            try:
-                page.wait_for_selector("table", timeout=7000)
-                page.wait_for_timeout(700)
-            except Exception:
-                pass
+            pass
 
-        # 7) Intentar EXPORTAR
+        # 6) Intentar exportar (preferido). Si falla, haremos fallback por HTML/iframes.
         df = None
         try:
             with page.expect_download(timeout=timeout_ms) as download_info:
@@ -463,25 +477,27 @@ def obtener_ultimo_costo_por_export(timeout_ms=35000):
             else:
                 b = open(download.path(), "rb").read()
 
-            # Descomenta para ver el archivo en artefactos
-            # with open("export_debug.xlsx", "wb") as f:
-            #     f.write(b)
+            # Artefacto de debug opcional del Excel:
+            with open("export_debug.xlsx", "wb") as f:
+                f.write(b)
 
             df = leer_excel_exportado_en_memoria(b)
         except Exception:
             df = None
 
-        # 8) Fallback: leer la tabla HTML visible en "Datos"
+        # 7) Fallback: leer la tabla HTML visible en cualquier frame + dejar artefactos (html_main.html, frame_*.html)
         if df is None or df.empty:
-            html = page.content()
-            # Descomenta para subir como artefacto
-            # with open("html_debug.html", "w", encoding="utf-8") as f:
-            #     f.write(html)
-            df = leer_tabla_html(html)
+            df = leer_tabla_html_desde_frames(page)
+
+        # 8) Screenshot para debug
+        try:
+            page.screenshot(path="page_after_buscar.png", full_page=True)
+        except Exception:
+            pass
 
         browser.close()
 
-    # 9) Filtrar la barra y devolver último registro
+    # 9) Filtrar barra y devolver el último registro
     df = filtrar_barra_robusto(df, BARRA_BUSCADA)
     df = df.sort_values("ts")
     row = df.iloc[-1]
@@ -495,6 +511,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=35000):
         ts = ts.tz_localize(TZ)
 
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
+
 
 
 
