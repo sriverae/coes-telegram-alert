@@ -57,6 +57,8 @@ jobs:
           path: |
             export_debug.xlsx
             html_main.html
+            datos_tabla.html
+            step*.png
             frame_*.html
             page_after_buscar.png
           if-no-files-found: ignore
