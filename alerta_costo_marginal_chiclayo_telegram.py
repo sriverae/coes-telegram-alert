@@ -462,95 +462,135 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
     con220 = candidatos[candidatos["Barra_norm"].str.contains("220", na=False)]
     return con220 if not con220.empty else candidatos
 
-def obtener_ultimo_costo_por_export(timeout_ms=35000):
+def obtener_ultimo_costo_por_export(timeout_ms=45000):
+    """
+    Nueva implementación: en vez de descargar Excel, entra a la pestaña 'Datos',
+    usa el buscador global de la tabla para filtrar 'CHICLAYO 220' (o lo que
+    tengas en BARRA_BUSCADA), y parsea la tabla HTML resultante.
+    Esto evita problemas de paginación y de export en el runner.
+    """
+    from io import StringIO
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(URL_COSTOS_TIEMPO_REAL, wait_until="networkidle", timeout=timeout_ms)
 
-        # 1) Cerrar el popup "Aviso" si aparece
+        # 1) Cerrar aviso si aparece
         try:
-            _close_aviso(page)
+            page.get_by_role("button", name=re.compile(r"aceptar", re.I)).click(timeout=4000)
         except Exception:
             pass
 
-        # 2) Ir a la pestaña "Datos" si existe
+        # 2) Click en "Buscar" para cargar datos del momento
         try:
-            page.get_by_text("Datos", exact=True).click(timeout=4000)
-            page.wait_for_timeout(300)
+            page.get_by_role("button", name=re.compile(r"^Buscar$", re.I)).click(timeout=7000)
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(1200)
         except Exception:
             pass
 
-        # 3) Intentar seleccionar filtros/última hora (opcionales)
+        # 3) Ir a la pestaña "Datos"
         try:
-            _select_filter_barras_138(page)
+            page.get_by_role("button", name=re.compile(r"^Datos$", re.I)).click(timeout=7000)
+            page.wait_for_timeout(700)  # pequeña espera a que se pinte la tabla
+        except Exception:
+            # último intento por texto simple
+            page.get_by_text("Datos", exact=True).click(timeout=7000)
+            page.wait_for_timeout(700)
+
+        # 4) Usar el buscador global de DataTables (filtra todas las páginas)
+        texto_buscar = BARRA_BUSCADA
+        ok_busqueda = False
+        try:
+            busc = page.locator("input[type='search']").first
+            if busc.count() > 0:
+                busc.fill(texto_buscar)
+                ok_busqueda = True
         except Exception:
             pass
-        try:
-            _select_last_hour(page)
-        except Exception:
-            pass
-
-        # 4) Buscar
-        try:
-            page.get_by_role("button", name=re.compile(r"^Buscar$", re.I)).click(timeout=6000)
-        except Exception:
-            pass
-
-        # 4.1) Si reaparece el aviso, cerrarlo
-        try:
-            _close_aviso(page)
-        except Exception:
-            pass
-
-        # 5) Asegurar pestaña "Datos"
-        try:
-            page.get_by_text("Datos", exact=True).click(timeout=4000)
-            page.wait_for_timeout(600)
-        except Exception:
-            pass
-
-        # 6) Intentar exportar (preferido). Si falla, haremos fallback por HTML/iframes.
-        df = None
-        try:
-            with page.expect_download(timeout=timeout_ms) as download_info:
-                try:
-                    page.get_by_text("Exportar", exact=True).click()
-                except Exception:
-                    page.get_by_role("button", name=re.compile(r"Exportar", re.I)).click()
-            download = download_info.value
-            if hasattr(download, "create_read_stream"):
-                b = download.create_read_stream().read()
-            else:
-                b = open(download.path(), "rb").read()
-
-            # Artefacto de debug opcional del Excel:
-            with open("export_debug.xlsx", "wb") as f:
-                f.write(b)
-
-            df = leer_excel_exportado_en_memoria(b)
-        except Exception:
-            df = None
-
-        # 7) Fallback: leer la tabla HTML visible en cualquier frame + dejar artefactos
-        if df is None or df.empty:
-            # dar tiempo a que el grid JS construya la tabla dentro de iframes
+        if not ok_busqueda:
+            # fallback por si el selector cambia
             try:
-                page.wait_for_timeout(1500)
+                page.get_by_placeholder(re.compile(r"Buscar|Search", re.I)).fill(texto_buscar)
+                ok_busqueda = True
             except Exception:
                 pass
-            df = leer_tabla_html_desde_frames(page)
 
-        # 8) Screenshot para debug
+        page.wait_for_timeout(900)
+
+        # 5) Localizar la tabla que tiene las columnas de CM (Barra/Hora/CM Total)
+        tabla = None
         try:
-            page.screenshot(path="page_after_buscar.png", full_page=True)
+            # Tabla cuyo header contiene "Barra" (o "Nodo") y "CM"
+            tabla = page.locator("table").filter(
+                has_text=re.compile(r"\b(Barra|Nodo)\b", re.I)
+            ).first
+            # Verificar que hay filas
+            page.wait_for_selector("table tbody tr", timeout=7000)
+        except Exception:
+            pass
+
+        if not tabla or tabla.count() == 0:
+            raise RuntimeError("No se encontró la tabla de 'Datos' después del filtro.")
+
+        # 6) Tomar el HTML de la tabla ya filtrada y guardarlo para debug
+        html_tabla = tabla.evaluate("el => el.outerHTML")
+        try:
+            with open("datos_tabla.html", "w", encoding="utf-8") as f:
+                f.write(html_tabla)
         except Exception:
             pass
 
         browser.close()
 
-    # 9) Filtrar barra y devolver el último registro
+    # 7) Parsear la tabla a DataFrame
+    tablas = pd.read_html(StringIO(html_tabla))
+    if not tablas:
+        raise RuntimeError("No se pudo parsear la tabla de 'Datos' a DataFrame.")
+    df = tablas[0].copy()
+
+    # 8) Detectar columnas de forma robusta y normalizarlas
+    def fcol(pat):
+        return next((c for c in df.columns if re.search(pat, str(c), re.I)), None)
+
+    col_hora = fcol(r"\bhora\b")
+    col_barra = fcol(r"\b(Barra|Nodo)\b")
+    col_cm_en = fcol(r"cm\s*energ")
+    col_cm_co = fcol(r"cm\s*conges")
+    col_cm_to = fcol(r"cm\s*total")
+
+    if not (col_hora and col_barra and col_cm_to):
+        raise RuntimeError("No se encontró una tabla con columnas esperadas (Hora/Barra/CM Total).")
+
+    df = df.rename(columns={
+        col_hora: "Hora",
+        col_barra: "Barra",
+        col_cm_to: "CM_Total",
+        **({col_cm_en: "CM_Energia"} if col_cm_en else {}),
+        **({col_cm_co: "CM_Congestion"} if col_cm_co else {}),
+    })
+
+    # 9) Convertir números
+    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
+        if c in df.columns:
+            df[c] = (
+                df[c].astype(str)
+                .str.replace(",", ".", regex=False)                    # por si viniera coma
+                .str.extract(r"([-]?[0-9]+(?:\.[0-9]+)?)")[0]
+                .astype(float)
+            )
+
+    # 10) Parsear hora
+    df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
+
+    # 11) Aunque ya filtramos con el buscador, afinamos con nuestro normalizador
     df = filtrar_barra_robusto(df, BARRA_BUSCADA)
+
+    if df.empty:
+        raise RuntimeError(f"No se obtuvo ningún registro para '{BARRA_BUSCADA}' tras filtrar la tabla.")
+
+    # 12) Quedarnos con el último por timestamp
     df = df.sort_values("ts")
     row = df.iloc[-1]
 
@@ -563,6 +603,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=35000):
         ts = ts.tz_localize(TZ)
 
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
+
 
 
 
