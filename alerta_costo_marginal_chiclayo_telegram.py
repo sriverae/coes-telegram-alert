@@ -532,8 +532,13 @@ def obtener_ultimo_costo_por_export(timeout_ms=35000):
         except Exception:
             df = None
 
-        # 7) Fallback: leer la tabla HTML visible en cualquier frame + dejar artefactos (html_main.html, frame_*.html)
+        # 7) Fallback: leer la tabla HTML visible en cualquier frame + dejar artefactos
         if df is None or df.empty:
+            # dar tiempo a que el grid JS construya la tabla dentro de iframes
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
             df = leer_tabla_html_desde_frames(page)
 
         # 8) Screenshot para debug
