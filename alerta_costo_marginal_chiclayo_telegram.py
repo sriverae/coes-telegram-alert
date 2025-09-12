@@ -539,47 +539,60 @@ def obtener_ultimo_costo_por_export(timeout_ms=60000):
         page.wait_for_timeout(900)
         _screenshot(page, "step4_tab_datos.png")
 
-        # 4) Esperar a que DataTables esté listo (search input o wrapper)
+        # 4) Esperar a que DataTables esté listo (wrapper + input de búsqueda)
+        try:
+            page.wait_for_selector("div.dataTables_wrapper", timeout=15000)
+        except Exception:
+            _screenshot(page, "step5_no_wrapper.png")
+            browser.close()
+            raise RuntimeError("No se encontró el contenedor de DataTables.")
+
+        # Localizador ROBUSTO del buscador global de DataTables
         buscador = None
-        try:
-            page.wait_for_selector("div.dataTables_wrapper", timeout=12000)
-        except Exception:
-            pass
-
-        try:
-            buscador = page.locator("div.dataTables_wrapper input[type='search']").first
-            if buscador.count() == 0:
-                buscador = None
-        except Exception:
-            buscador = None
-
+        # a) patrón clásico
+        loc = page.locator("div.dataTables_wrapper div.dataTables_filter input[type='search']")
+        if loc.count() > 0:
+            buscador = loc.first
+        # b) variaciones
         if buscador is None:
-            # otro intento por placeholder o cualquier input visible dentro del wrapper
-            try:
-                buscador = page.get_by_placeholder(re.compile(r"Buscar|Search", re.I))
-            except Exception:
-                pass
-
+            loc = page.locator("div.dataTables_filter input")
+            if loc.count() > 0:
+                buscador = loc.first
         if buscador is None:
-            # como último recurso, intenta clicar de nuevo 'Datos' y esperar
-            _click_possibles(page, [r"^Datos$", "Datos"])
-            page.wait_for_selector("div.dataTables_wrapper", timeout=12000)
-            try:
-                buscador = page.locator("div.dataTables_wrapper input[type='search']").first
-            except Exception:
-                buscador = None
+            # Buscar el input dentro de la etiqueta del filtro (label: Buscar:)
+            loc = page.locator("div.dataTables_filter label").locator("input")
+            if loc.count() > 0:
+                buscador = loc.first
 
         if buscador is None:
             _screenshot(page, "step5_no_search.png")
             browser.close()
-            raise RuntimeError("No se encontró la tabla de 'Datos' después del filtro.")
+            raise RuntimeError("No se encontró la caja de búsqueda de DataTables.")
 
-        # 5) Filtrar por la barra objetivo (esto atraviesa TODA la paginación)
+        # 5) Filtrar por la barra objetivo (atraviesa TODA la paginación)
         texto_buscar = BARRA_BUSCADA
-        buscador.fill("")         # limpia
-        buscador.type(texto_buscar, delay=30)
-        page.wait_for_timeout(900)
-        _screenshot(page, "step6_filtered.png")
+        buscador.fill("")               # limpia
+        buscador.type(texto_buscar, delay=25)
+        _screenshot(page, "step6_typed_filter.png")
+
+        # Espera a que la tabla muestre al menos una fila que contenga la barra
+        try:
+            page.wait_for_function(
+                """(barra) => {
+                    const wrap = document.querySelector('div.dataTables_wrapper');
+                    if (!wrap) return false;
+                    const rows = wrap.querySelectorAll('table tbody tr');
+                    if (!rows.length) return false;
+                    const upper = barra.toUpperCase();
+                    return Array.from(rows).some(r => r.innerText.toUpperCase().includes(upper));
+                }""",
+                texto_buscar,
+                timeout=10000
+            )
+        except Exception:
+            _screenshot(page, "step6_wait_for_filter_timeout.png")
+            # seguimos, igual extraemos HTML para ver qué hay
+
 
         # 6) Localizar la tabla (header con Barra/Nodo)
         tabla = None
