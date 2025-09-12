@@ -462,79 +462,142 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
     con220 = candidatos[candidatos["Barra_norm"].str.contains("220", na=False)]
     return con220 if not con220.empty else candidatos
 
-def obtener_ultimo_costo_por_export(timeout_ms=45000):
+def obtener_ultimo_costo_por_export(timeout_ms=60000):
     """
-    Nueva implementación: en vez de descargar Excel, entra a la pestaña 'Datos',
-    usa el buscador global de la tabla para filtrar 'CHICLAYO 220' (o lo que
-    tengas en BARRA_BUSCADA), y parsea la tabla HTML resultante.
-    Esto evita problemas de paginación y de export en el runner.
+    Flujo robusto:
+      - Cierra el aviso.
+      - Buscar -> pestaña 'Datos'.
+      - Usa el buscador global de DataTables para filtrar 'BARRA_BUSCADA'.
+      - Parsear la tabla filtrada (evita paginación).
+      - Devuelve último registro (por Hora).
+    También genera archivos de depuración: step*.png, html_main.html, datos_tabla.html
     """
     from io import StringIO
 
+    def _screenshot(page, name):
+        try:
+            page.screenshot(path=name)
+        except Exception:
+            pass
+
+    def _click_possibles(page, textos, timeout=7000):
+        # Prueba varios selectores por texto exacto, aproximado y rol
+        for t in textos:
+            try:
+                page.get_by_role("button", name=re.compile(t, re.I)).click(timeout=timeout)
+                return True
+            except Exception:
+                pass
+            try:
+                page.get_by_text(t, exact=True).click(timeout=timeout)
+                return True
+            except Exception:
+                pass
+            try:
+                page.locator(f"button:has-text('{t}')").first.click(timeout=timeout)
+                return True
+            except Exception:
+                pass
+            try:
+                page.locator(f"a:has-text('{t}')").first.click(timeout=timeout)
+                return True
+            except Exception:
+                pass
+        return False
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        page = browser.new_page(viewport={"width": 1366, "height": 900})
         page.goto(URL_COSTOS_TIEMPO_REAL, wait_until="networkidle", timeout=timeout_ms)
 
-        # 1) Cerrar aviso si aparece
+        # Guardar HTML inicial para debug
         try:
-            page.get_by_role("button", name=re.compile(r"aceptar", re.I)).click(timeout=4000)
+            with open("html_main.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
         except Exception:
             pass
+        _screenshot(page, "step1_loaded.png")
 
-        # 2) Click en "Buscar" para cargar datos del momento
-        try:
-            page.get_by_role("button", name=re.compile(r"^Buscar$", re.I)).click(timeout=7000)
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(1200)
-        except Exception:
-            pass
+        # 1) Cerrar aviso ("Aceptar" o "X")
+        _click_possibles(page, [r"Aceptar", r"^Aceptar$", r"×", r"X"])
+        page.wait_for_timeout(600)
+        _screenshot(page, "step2_modal_closed.png")
 
-        # 3) Ir a la pestaña "Datos"
-        try:
-            page.get_by_role("button", name=re.compile(r"^Datos$", re.I)).click(timeout=7000)
-            page.wait_for_timeout(700)  # pequeña espera a que se pinte la tabla
-        except Exception:
-            # último intento por texto simple
-            page.get_by_text("Datos", exact=True).click(timeout=7000)
-            page.wait_for_timeout(700)
+        # 2) Click en Buscar
+        _click_possibles(page, [r"^Buscar$","Buscar"])
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1200)
+        _screenshot(page, "step3_clicked_buscar.png")
 
-        # 4) Usar el buscador global de DataTables (filtra todas las páginas)
-        texto_buscar = BARRA_BUSCADA
-        ok_busqueda = False
-        try:
-            busc = page.locator("input[type='search']").first
-            if busc.count() > 0:
-                busc.fill(texto_buscar)
-                ok_busqueda = True
-        except Exception:
-            pass
-        if not ok_busqueda:
-            # fallback por si el selector cambia
+        # 3) Ir a pestaña Datos
+        if not _click_possibles(page, [r"^Datos$", "Datos"]):
+            # fallback: una pestaña con aria-controls de datos
             try:
-                page.get_by_placeholder(re.compile(r"Buscar|Search", re.I)).fill(texto_buscar)
-                ok_busqueda = True
+                page.locator("[aria-controls*='Datos'], [data-target*='Datos']").first.click(timeout=5000)
+            except Exception:
+                pass
+        page.wait_for_timeout(900)
+        _screenshot(page, "step4_tab_datos.png")
+
+        # 4) Esperar a que DataTables esté listo (search input o wrapper)
+        buscador = None
+        try:
+            page.wait_for_selector("div.dataTables_wrapper", timeout=12000)
+        except Exception:
+            pass
+
+        try:
+            buscador = page.locator("div.dataTables_wrapper input[type='search']").first
+            if buscador.count() == 0:
+                buscador = None
+        except Exception:
+            buscador = None
+
+        if buscador is None:
+            # otro intento por placeholder o cualquier input visible dentro del wrapper
+            try:
+                buscador = page.get_by_placeholder(re.compile(r"Buscar|Search", re.I))
             except Exception:
                 pass
 
-        page.wait_for_timeout(900)
+        if buscador is None:
+            # como último recurso, intenta clicar de nuevo 'Datos' y esperar
+            _click_possibles(page, [r"^Datos$", "Datos"])
+            page.wait_for_selector("div.dataTables_wrapper", timeout=12000)
+            try:
+                buscador = page.locator("div.dataTables_wrapper input[type='search']").first
+            except Exception:
+                buscador = None
 
-        # 5) Localizar la tabla que tiene las columnas de CM (Barra/Hora/CM Total)
-        tabla = None
-        try:
-            # Tabla cuyo header contiene "Barra" (o "Nodo") y "CM"
-            tabla = page.locator("table").filter(
-                has_text=re.compile(r"\b(Barra|Nodo)\b", re.I)
-            ).first
-            # Verificar que hay filas
-            page.wait_for_selector("table tbody tr", timeout=7000)
-        except Exception:
-            pass
-
-        if not tabla or tabla.count() == 0:
+        if buscador is None:
+            _screenshot(page, "step5_no_search.png")
+            browser.close()
             raise RuntimeError("No se encontró la tabla de 'Datos' después del filtro.")
 
-        # 6) Tomar el HTML de la tabla ya filtrada y guardarlo para debug
+        # 5) Filtrar por la barra objetivo (esto atraviesa TODA la paginación)
+        texto_buscar = BARRA_BUSCADA
+        buscador.fill("")         # limpia
+        buscador.type(texto_buscar, delay=30)
+        page.wait_for_timeout(900)
+        _screenshot(page, "step6_filtered.png")
+
+        # 6) Localizar la tabla (header con Barra/Nodo)
+        tabla = None
+        try:
+            tabla = page.locator("div.dataTables_wrapper table").filter(
+                has=page.locator("thead")
+            ).first
+            # asegurar que hay filas
+            page.wait_for_selector("div.dataTables_wrapper table tbody tr", timeout=8000)
+        except Exception:
+            tabla = None
+
+        if not tabla or tabla.count() == 0:
+            _screenshot(page, "step7_no_table.png")
+            browser.close()
+            raise RuntimeError("No se encontró la tabla de 'Datos' después del filtro.")
+
+        # 7) Extraer HTML de la tabla ya filtrada y guardarlo
         html_tabla = tabla.evaluate("el => el.outerHTML")
         try:
             with open("datos_tabla.html", "w", encoding="utf-8") as f:
@@ -544,13 +607,14 @@ def obtener_ultimo_costo_por_export(timeout_ms=45000):
 
         browser.close()
 
-    # 7) Parsear la tabla a DataFrame
+    # 8) Parsear DataFrame desde la tabla filtrada
     tablas = pd.read_html(StringIO(html_tabla))
     if not tablas:
         raise RuntimeError("No se pudo parsear la tabla de 'Datos' a DataFrame.")
+
     df = tablas[0].copy()
 
-    # 8) Detectar columnas de forma robusta y normalizarlas
+    # 9) Detectar columnas de forma flexible
     def fcol(pat):
         return next((c for c in df.columns if re.search(pat, str(c), re.I)), None)
 
@@ -571,29 +635,27 @@ def obtener_ultimo_costo_por_export(timeout_ms=45000):
         **({col_cm_co: "CM_Congestion"} if col_cm_co else {}),
     })
 
-    # 9) Convertir números
+    # 10) Números
     for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
         if c in df.columns:
             df[c] = (
                 df[c].astype(str)
-                .str.replace(",", ".", regex=False)                    # por si viniera coma
-                .str.extract(r"([-]?[0-9]+(?:\.[0-9]+)?)")[0]
+                .str.replace(",", ".", regex=False)
+                .str.extract(r"([-]?\d+(?:\.\d+)?)")[0]
                 .astype(float)
             )
 
-    # 10) Parsear hora
+    # 11) Hora
     df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
 
-    # 11) Aunque ya filtramos con el buscador, afinamos con nuestro normalizador
+    # 12) Afinar por barra (por si el buscador trajo variantes)
     df = filtrar_barra_robusto(df, BARRA_BUSCADA)
-
     if df.empty:
         raise RuntimeError(f"No se obtuvo ningún registro para '{BARRA_BUSCADA}' tras filtrar la tabla.")
 
-    # 12) Quedarnos con el último por timestamp
+    # 13) Último registro
     df = df.sort_values("ts")
     row = df.iloc[-1]
-
     energia = float(row["CM_Energia"]) if "CM_Energia" in df.columns else None
     congestion = float(row["CM_Congestion"]) if "CM_Congestion" in df.columns else None
     total = float(row["CM_Total"])
@@ -603,9 +665,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=45000):
         ts = ts.tz_localize(TZ)
 
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
-
-
-
 
 
 def ejecutar_iteracion():
