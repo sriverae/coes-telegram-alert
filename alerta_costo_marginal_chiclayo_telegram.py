@@ -463,6 +463,89 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
     con220 = candidatos[candidatos["Barra_norm"].str.contains("220", na=False)]
     return con220 if not con220.empty else candidatos
 
+def set_fecha_hoy_y_ultima_hora(page):
+    """
+    Coloca la FECHA de HOY (America/Lima) en formato dd/mm/yyyy y
+    selecciona la ÚLTIMA hora disponible del combo horario.
+    """
+    import re
+    from datetime import datetime
+
+    # --- FECHA (dd/mm/yyyy) ---
+    hoy_str = datetime.now(TZ).strftime("%d/%m/%Y")
+
+    # Varios selectores posibles para el input de fecha (robusto)
+    fecha_selectors = [
+        "#txtFecha", "#TxtFecha", "#fecha",
+        "input[name='fecha']",
+        "input[placeholder*='Fecha' i]",
+        "xpath=//label[contains(.,'Fecha')]/following::input[1]"
+    ]
+    fecha_input = None
+    for sel in fecha_selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                fecha_input = loc.first
+                break
+        except Exception:
+            pass
+
+    if fecha_input:
+        try:
+            fecha_input.click()
+            # limpia completamente (algunos datepickers se quedan con caret al medio)
+            fecha_input.fill("")
+            # escribe con pausas para evitar máscara de entrada
+            fecha_input.type(hoy_str, delay=20)
+            fecha_input.press("Enter")
+            page.wait_for_timeout(250)
+        except Exception:
+            pass
+
+    # --- HORA (máxima HH:MM disponible) ---
+    def _score_time(texto: str) -> int:
+        m = re.search(r"(\d{1,2}):(\d{2})", texto or "")
+        if not m:
+            return -1
+        h, mnt = int(m.group(1)), int(m.group(2))
+        return h * 60 + mnt
+
+    mejor_seleccion = False
+
+    selects = page.locator("select")
+    try:
+        n = selects.count()
+    except Exception:
+        n = 0
+
+    for i in range(n):
+        sel = selects.nth(i)
+        try:
+            opts = sel.locator("option")
+            texts = opts.all_inner_texts()
+        except Exception:
+            texts = []
+
+        # Si este <select> es el de hora, tendrá varias opciones con HH:MM
+        puntuados = [(_score_time(t), t, opts.nth(j).get_attribute("value")) for j, t in enumerate(texts)]
+        if not puntuados or max(p[0] for p in puntuados) < 0:
+            continue
+
+        # Elegir la hora con mayor puntaje (la más tardía)
+        sc, label, value = max(puntuados, key=lambda x: x[0])
+        try:
+            if value and value.strip():
+                sel.select_option(value=value)
+            else:
+                sel.select_option(label=label.strip())
+            mejor_seleccion = True
+            break
+        except Exception:
+            continue
+
+    return mejor_seleccion
+
 def obtener_ultimo_costo_por_export(timeout_ms=120000):
     """
     Flujo robusto para la página nueva:
@@ -637,26 +720,33 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         page.wait_for_load_state("networkidle")
         _screenshot(page, "step1_loaded.png")
 
-        _cerrar_aviso(page)
+        # --- cerrar aviso preliminar ---
+        _cerrar_aviso(page)   # tu helper
         _screenshot(page, "step2_modal_closed.png")
 
-        # Fuerza FECHA (hoy) y HORA (última)
-        _set_fecha_hoy(page)
-        _set_ultima_hora(page)
+        # --- FECHA de HOY (dd/mm/yyyy) + ÚLTIMA HORA disponible ---
+        try:
+            _set_fecha_hoy(page)      # tu helper: fuerza dd/mm/yyyy
+        except Exception:
+            pass
+        try:
+            _set_ultima_hora(page)    # tu helper: elige la hora más tarde (HH:MM)
+        except Exception:
+            pass
+        page.wait_for_timeout(300)
 
-        # Buscar
+        # --- ¡OJO!: en esta página es "Buscar" (no "Consultar") ---
         _click_possibles(page, [r"^Buscar$", "Buscar"])
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(800)
         _screenshot(page, "step3_clicked_buscar.png")
 
-        # Datos
+        # --- abrir la pestaña "Datos" (tu helper) ---
         if not _abrir_datos(page):
-            _screenshot(page, "step4_after_try_datos.png")
+            _screenshot(page, "step4_no_datos_tab.png")
             browser.close()
             raise RuntimeError("No se pudo abrir la pestaña 'Datos'.")
-
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(600)
         _screenshot(page, "step4_tab_datos.png")
 
         # Busca input DataTables (si existe)
