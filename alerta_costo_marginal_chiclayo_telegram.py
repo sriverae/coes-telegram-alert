@@ -463,17 +463,18 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
     con220 = candidatos[candidatos["Barra_norm"].str.contains("220", na=False)]
     return con220 if not con220.empty else candidatos
 
-def obtener_ultimo_costo_por_export(timeout_ms=120000):
+def obtener_ultimo_costo_por_export(timeout_ms=90000):
     """
-    Flujo:
-      1) Cierra avisos.
-      2) Selecciona última hora (#cbHoras) y filtro por defecto (#cbDefecto='S') si existen.
-      3) Click en 'Consultar'/'Buscar'.
-      4) INTENTO A: Exportar → leer Excel en memoria.
-      5) PLAN B: Si no hay Excel, usa la tabla de 'Datos' (si ya aparece, no clickea; si no, abre la pestaña).
-         - Usa buscador de DataTables si existe; si no, recorre paginación.
-      6) Devuelve el último registro por Hora.
-    Deja step*.png y datos_tabla.html para debug (si tu workflow los sube).
+    Flujo robusto:
+      - Cierra aviso ("Aceptar") si aparece.
+      - Selecciona la última hora (#cbHoras) y el filtro por defecto (si existe).
+      - Click en "Consultar" (o "Buscar" si es la versión vieja).
+      - (Opcional) Intenta abrir pestaña "Datos". Si no se puede o no es necesario, sigue igual.
+      - Si existe input de búsqueda de DataTables => filtra por BARRA_BUSCADA.
+        Si NO existe => recorre paginación hasta encontrar la barra.
+      - Extrae la tabla visible (filtrada o de la página donde esté la barra), la parsea
+        y devuelve el último registro por Hora.
+    Además, guarda capturas step*.png y datos_tabla.html para debug.
     """
     from io import StringIO
 
@@ -512,7 +513,123 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
                 pass
         return False
 
-    def _seleccionar_ultima_hora(page):
+    def _click_datos_tab(page):
+        """
+        Intenta abrir 'Datos', pero si falla, no interrumpe.
+        Hace 3 intentos: CSS directo, click normal por texto, y click por JS.
+        """
+        try:
+            loc = page.locator(".item-change-dashboard[data-fuente='datos']").first
+            if loc.count() > 0 and loc.is_visible():
+                try:
+                    loc.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    loc.click(timeout=3000)
+                    return True
+                except Exception:
+                    pass
+                # Click vía JS (evita overlays)
+                try:
+                    page.evaluate(
+                        """el => { el.scrollIntoView({block:'center'}); el.click(); }""",
+                        loc
+                    )
+                    return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Fallback por texto
+        if _click_possibles(page, [r"^Datos$", "Datos"], timeout=3000):
+            return True
+        # Si no se pudo, devolvemos False (pero no lanzamos excepción)
+        return False
+
+    def _tabla_en_resultado(page):
+        """
+        Encuentra una tabla con pinta de resultados. Prioriza #resultado table, pero
+        si no existe, busca tablas que tengan columnas de CM/Barra/Nodo.
+        """
+        # 1) Caso esperado
+        try:
+            page.wait_for_selector("#resultado table", timeout=6000)
+            return page.locator("#resultado table").first
+        except Exception:
+            pass
+
+        # 2) Otras tablas con cabeceras típicas
+        candidatos = [
+            "table:has(th:has-text('CM Total'))",
+            "table:has(th:has-text('Barra'))",
+            "table:has(th:has-text('Nodo'))",
+            "table:has(th:has-text('CM Energ'))",
+            "table:has(th:has-text('Congest'))",
+        ]
+        for sel in candidatos:
+            try:
+                if page.locator(sel).count() > 0:
+                    return page.locator(sel).first
+            except Exception:
+                pass
+        return None
+
+    def _buscar_input_datatables(page):
+        sel_list = [
+            "div.dataTables_wrapper div.dataTables_filter input[type='search']",
+            "#resultado .dataTables_filter input[type='search']",
+            "div.dataTables_filter input",
+            "input[type='search']"
+        ]
+        for sel in sel_list:
+            loc = page.locator(sel)
+            try:
+                if loc.count() > 0 and loc.first.is_visible():
+                    return loc.first
+            except Exception:
+                pass
+        return None
+
+    def _tabla_html(page, tabla_locator=None):
+        t = tabla_locator or _tabla_en_resultado(page)
+        if not t:
+            return None
+        try:
+            # Asegura filas si aplica
+            try:
+                page.wait_for_selector("tbody tr", timeout=5000)
+            except Exception:
+                pass
+            return t.evaluate("el => el.outerHTML")
+        except Exception:
+            return None
+
+    def _tabla_contiene_barra(html, barra):
+        if not html:
+            return False
+        return (barra or "").upper().replace(" ", "") in re.sub(r"\s+", "", html.upper())
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1366, "height": 900})
+        page.goto(URL_COSTOS_TIEMPO_REAL, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_load_state("networkidle")
+
+        # Guarda HTML por si acaso
+        try:
+            with open("html_main.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+        except Exception:
+            pass
+        _screenshot(page, "step1_loaded.png")
+
+        # Cierra aviso (Aceptar) si aparece
+        _click_possibles(page, [r"^Aceptar$", "Aceptar", r"×", r"X"])
+        page.wait_for_timeout(300)
+        _screenshot(page, "step2_modal_closed.png")
+
+        # Seleccionar última hora si existe #cbHoras
         try:
             if page.locator("#cbHoras").count() > 0:
                 sel = page.locator("#cbHoras")
@@ -530,268 +647,105 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         except Exception:
             pass
 
-    def _asegurar_filtro_defecto(page):
+        # Asegura filtro por defecto si existe #cbDefecto (barras > 138 kV)
         try:
             if page.locator("#cbDefecto").count() > 0:
                 page.select_option("#cbDefecto", value="S")
         except Exception:
             pass
 
-    def _hay_tabla_visible(page):
-        """¿Existe alguna tabla candidata ya visible?"""
-        sels = [
-            "div.dataTables_wrapper table",
-            "table#tbDatos",
-            "table[id*='tb']",
-            "table:has(thead)",
-        ]
-        for s in sels:
-            try:
-                loc = page.locator(s)
-                if loc.count() > 0 and loc.first.is_visible():
-                    return True
-            except Exception:
-                pass
-        return False
-
-    def _click_datos_tab(page):
-        """Forzar 'Datos' por varias vías (pero solo si no hay tabla aún)."""
-        # 1) Botón/elemento tipo tab
-        try:
-            el = page.locator(".item-change-dashboard[data-fuente='datos']").first
-            if el.count() > 0:
-                el.scroll_into_view_if_needed(timeout=3000)
-                try:
-                    el.click(timeout=3000)
-                    return True
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # 2) Texto visible
-        if _click_possibles(page, [r"^Datos$", "Datos"], timeout=3000):
-            return True
-        # 3) JS directo
-        try:
-            ok = page.evaluate("""
-                () => {
-                    const kill = s => document.querySelector(s)?.click();
-                    kill('#btnAceptarComunicado');
-                    const cand = Array.from(document.querySelectorAll('.item-change-dashboard, button, a'));
-                    const el = cand.find(x => /datos/i.test(x.textContent||'') || x.getAttribute?.('data-fuente')==='datos');
-                    if (el) { el.dispatchEvent(new MouseEvent('click', {bubbles:true})); return true; }
-                    return false;
-                }
-            """)
-            if ok:
-                return True
-        except Exception:
-            pass
-        # 4) último intento: segundo tab genérico
-        try:
-            el2 = page.locator(".item-change-dashboard").nth(1)
-            if el2.count() > 0:
-                el2.click(force=True, timeout=3000)
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _tabla_locator(page):
-        """Devuelve el locator de la primera tabla útil."""
-        sels = [
-            "div.dataTables_wrapper table",
-            "table#tbDatos",
-            "table[id*='tb']",
-            "table:has(thead:has-text('CM'))",
-            "table:has(th:has-text('Barra')), table:has(th:has-text('Nodo'))",
-        ]
-        for s in sels:
-            try:
-                loc = page.locator(s)
-                if loc.count() > 0:
-                    return loc.first
-            except Exception:
-                pass
-        return None
-
-    def _tabla_html(page):
-        t = _tabla_locator(page)
-        if not t:
-            return None
-        try:
-            page.wait_for_selector("tbody tr", timeout=8000)
-        except Exception:
-            pass
-        try:
-            return t.evaluate("el => el.outerHTML")
-        except Exception:
-            return None
-
-    def _buscar_input_datatables(page):
-        sels = [
-            "div.dataTables_filter input[type='search']",
-            "label:has-text('Buscar') input",
-            "input[type='search']",
-        ]
-        for s in sels:
-            try:
-                loc = page.locator(s)
-                if loc.count() > 0:
-                    return loc.first
-            except Exception:
-                pass
-        return None
-
-    def _tabla_contiene_barra(html, barra):
-        if not html:
-            return False
-        return (barra or "").upper().replace(" ", "") in re.sub(r"\s+", "", html.upper())
-
-    def _intentar_export(page):
-        try:
-            with page.expect_download(timeout=25000) as dl_info:
-                ok = _click_possibles(page, [r"^Exportar$", "Exportar", "Exportar Masivo"])
-                if not ok:
-                    return None
-            download = dl_info.value
-            path = "export_debug.xlsx"
-            download.save_as(path)
-            with open(path, "rb") as f:
-                return f.read()
-        except Exception:
-            return None
-
-    # --- Navegación ---
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1366, "height": 900})
-        page.goto(URL_COSTOS_TIEMPO_REAL, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_load_state("networkidle")
-
-        # Dump inicial
-        try:
-            with open("html_main.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
-        except Exception:
-            pass
-        _screenshot(page, "step1_loaded.png")
-
-        _click_possibles(page, [r"^Aceptar$", "Aceptar", r"×", r"X"])
-        page.wait_for_timeout(400)
-        _screenshot(page, "step2_modal_closed.png")
-
-        _seleccionar_ultima_hora(page)
-        _asegurar_filtro_defecto(page)
-
+        # Click en "Consultar" (o "Buscar" si la UI vieja)
         _click_possibles(page, [r"^Consultar$", "Consultar", r"^Buscar$", "Buscar"])
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(800)
         _screenshot(page, "step3_clicked_consultar.png")
 
-        # INTENTO A: Exportar
-        excel_bytes = _intentar_export(page)
-        if excel_bytes:
-            try:
-                df = leer_excel_exportado_en_memoria(excel_bytes)
-                df = filtrar_barra_robusto(df, BARRA_BUSCADA)
-                if not df.empty:
-                    df = df.sort_values("ts")
-                    row = df.iloc[-1]
-                    energia = float(row["CM_Energia"]) if "CM_Energia" in df.columns else None
-                    congestion = float(row["CM_Congestion"]) if "CM_Congestion" in df.columns else None
-                    total = float(row["CM_Total"])
-                    ts = row["ts"]
-                    if ts.tzinfo is None:
-                        ts = ts.tz_localize(TZ)
-                    browser.close()
-                    return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
-            except Exception:
-                pass  # seguimos al plan B
+        # (Opcional) Ir a pestaña Datos; si no se puede, seguimos igual
+        _click_datos_tab(page)
+        page.wait_for_timeout(600)
+        _screenshot(page, "step4_after_try_datos.png")
 
-        # PLAN B: Tabla (si ya hay tabla, no tocamos; si no, abrimos Datos)
-        if not _hay_tabla_visible(page):
-            if not _click_datos_tab(page):
-                _screenshot(page, "step4_no_datos_tab.png")
-                browser.close()
-                raise RuntimeError("No se pudo abrir la pestaña 'Datos'.")
-            page.wait_for_timeout(900)
-        _screenshot(page, "step4_tab_datos.png")
-
-        # Esperar que exista alguna tabla utilizable
-        if not _tabla_locator(page):
+        # Esperar/obtener tabla
+        tabla = _tabla_en_resultado(page)
+        if not tabla:
             _screenshot(page, "step5_no_table.png")
             browser.close()
-            raise RuntimeError("No se encontró ninguna tabla en 'Datos'.")
+            raise RuntimeError("No se encontró ninguna tabla de resultados.")
 
-        # Buscar con input si existe
+        # Si existe input de búsqueda → úsalo
         buscador = _buscar_input_datatables(page)
         html_tabla = None
+
         if buscador is not None:
             try:
                 buscador.fill("")
                 buscador.type(BARRA_BUSCADA, delay=20)
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(300)
                 page.wait_for_function(
                     """(texto) => {
-                        const t = document.querySelector('div.dataTables_wrapper table') || document.querySelector('table');
+                        const area = document.querySelector('#resultado') || document;
+                        const t = area.querySelector('table');
                         if (!t) return false;
                         const rows = t.querySelectorAll('tbody tr');
-                        const u = (texto||'').toUpperCase();
+                        const u = (texto || '').toUpperCase();
                         return Array.from(rows).some(r => r.innerText.toUpperCase().includes(u));
                     }""",
                     BARRA_BUSCADA,
-                    timeout=9000
+                    timeout=7000
                 )
-                html_tabla = _tabla_html(page)
+                html_tabla = _tabla_html(page, tabla)
+                _screenshot(page, "step6_filtered.png")
             except Exception:
                 pass
 
-        # Si no hay input o no apareció, recorre paginación
+        # Si no hay input o falló el filtrado, recorre paginación buscando la barra
         if not html_tabla:
-            html = _tabla_html(page)
+            html = _tabla_html(page, tabla)
             if _tabla_contiene_barra(html, BARRA_BUSCADA):
                 html_tabla = html
             else:
-                def _hay_siguiente():
+                # intenta navegar por la paginación
+                def _next_selector():
                     sels = [
                         ".dataTables_paginate .paginate_button.next:not(.disabled)",
                         "a.paginate_button.next:not(.disabled)",
-                        "ul.pagination li.next:not(.disabled) a",
-                        ".dataTables_paginate a[aria-label='Next']:not(.disabled)",
-                        ".dataTables_paginate a:has-text('Siguiente'):not(.disabled)",
-                        ".dataTables_paginate a:has-text('>'):not(.disabled)",
+                        "a:has-text('Siguiente'):not(.disabled)",
+                        "a:has-text('Next'):not(.disabled)",
+                        ".paginate_button:has(span:has-text('›')):not(.disabled)",
+                        ".paginate_button:has-text('›'):not(.disabled)"
                     ]
                     for s in sels:
                         try:
-                            loc = page.locator(s)
-                            if loc.count() > 0 and loc.first.is_visible():
-                                return loc.first
+                            loc = page.locator(s).first
+                            if loc.count() > 0 and loc.is_visible():
+                                return s
                         except Exception:
                             pass
                     return None
 
                 visitadas = 0
                 while True:
-                    next_btn = _hay_siguiente()
-                    if not next_btn or visitadas > 80:
+                    sel_next = _next_selector()
+                    if not sel_next or visitadas > 60:
                         break
                     try:
-                        next_btn.click()
-                        page.wait_for_timeout(700)
-                        html = _tabla_html(page)
+                        page.locator(sel_next).first.click()
+                        page.wait_for_timeout(500)
+                        html = _tabla_html(page, tabla)
                         if _tabla_contiene_barra(html, BARRA_BUSCADA):
                             html_tabla = html
+                            _screenshot(page, "step7_found_in_pagination.png")
                             break
                         visitadas += 1
                     except Exception:
                         break
 
         if not html_tabla:
-            _screenshot(page, "step6_no_match_table.png")
+            _screenshot(page, "step8_no_match_table.png")
             browser.close()
             raise RuntimeError(f"No se encontró '{BARRA_BUSCADA}' en ninguna página de la tabla.")
 
+        # Guarda la tabla para diagnóstico
         try:
             with open("datos_tabla.html", "w", encoding="utf-8") as f:
                 f.write(html_tabla)
@@ -800,12 +754,14 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
 
         browser.close()
 
-    # Parseo final
+    # Parseo con pandas
     tablas = pd.read_html(StringIO(html_tabla))
     if not tablas:
-        raise RuntimeError("No se pudo parsear la tabla de 'Datos' a DataFrame.")
+        raise RuntimeError("No se pudo parsear la tabla de resultados a DataFrame.")
+
     df = tablas[0].copy()
 
+    # Mapear columnas de forma flexible
     def fcol(pat):
         return next((c for c in df.columns if re.search(pat, str(c), re.I)), None)
 
@@ -826,6 +782,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         **({col_cm_co: "CM_Congestion"} if col_cm_co else {}),
     })
 
+    # Números
     for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
         if c in df.columns:
             df[c] = (
@@ -835,11 +792,15 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
                 .astype(float)
             )
 
+    # Hora
     df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
+
+    # Afinar por barra por si el buscador/paginación trajo variantes
     df = filtrar_barra_robusto(df, BARRA_BUSCADA)
     if df.empty:
         raise RuntimeError(f"No se obtuvo ningún registro para '{BARRA_BUSCADA}' tras filtrar la tabla.")
 
+    # Último registro
     df = df.sort_values("ts")
     row = df.iloc[-1]
     energia = float(row["CM_Energia"]) if "CM_Energia" in df.columns else None
@@ -851,7 +812,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         ts = ts.tz_localize(TZ)
 
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
-
 
 
 
