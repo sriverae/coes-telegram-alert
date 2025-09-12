@@ -467,14 +467,13 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
     """
     Flujo robusto:
       - Cierra aviso ("Aceptar") si aparece.
-      - Selecciona la última hora (#cbHoras) y el filtro por defecto (si existe).
+      - Selecciona la última hora (#cbHoras) y el filtro por defecto (#cbDefecto) si existen.
       - Click en "Consultar" (o "Buscar" si es la versión vieja).
       - Abre pestaña "Datos".
       - Si existe input de búsqueda de DataTables => filtra por BARRA_BUSCADA.
         Si NO existe => recorre paginación hasta encontrar la barra.
-      - Extrae la tabla visible (filtrada o de la página donde esté la barra), la parsea
-        y devuelve el último registro por Hora.
-    Además, guarda capturas step*.png y datos_tabla.html para debug.
+      - Extrae la tabla visible (filtrada o de la página donde esté la barra) y devuelve el último registro (por Hora).
+    Guarda capturas step*.png, html_main.html y datos_tabla.html para debug.
     """
     from io import StringIO
 
@@ -485,6 +484,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
             pass
 
     def _click_possibles(page, textos, timeout=7000):
+        """Prueba distintos métodos de click por texto/rol/selector."""
         for t in textos:
             try:
                 page.get_by_role("button", name=re.compile(t, re.I)).click(timeout=timeout)
@@ -514,12 +514,40 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
         return False
 
     def _click_datos_tab(page):
-        # Intenta por data-fuente y por texto visible
+        """Activa el tab 'Datos' de la versión nueva (y fallback por texto)."""
+        # Espera a que exista el elemento del tab
         try:
-            page.locator(".item-change-dashboard[data-fuente='datos']").first.click(timeout=4000)
+            page.wait_for_selector(".item-change-dashboard[data-fuente='datos']", timeout=7000)
+        except Exception:
+            pass
+
+        # Intenta CSS directo con scroll y eventos JS (para byebye overlays)
+        try:
+            page.evaluate("""
+                () => {
+                    // cerrar popups que a veces bloquean
+                    document.querySelector('#btnAceptarComunicado')?.click();
+                    document.querySelector('#popupMensaje .b-close')?.click();
+                    document.querySelector('#popupCalendario .b-close')?.click();
+
+                    const el = document.querySelector('.item-change-dashboard[data-fuente="datos"]');
+                    if (el) {
+                        el.scrollIntoView({block: 'center'});
+                        const evt = new MouseEvent('click', {bubbles:true});
+                        el.dispatchEvent(evt);
+                    }
+                }
+            """)
+            # esperar a que #resultado empiece a llenarse
+            page.wait_for_function(
+                """() => !!document.querySelector('#resultado')""",
+                timeout=4000
+            )
             return True
         except Exception:
             pass
+
+        # Como última opción, clic por texto
         return _click_possibles(page, [r"^Datos$", "Datos"], timeout=4000)
 
     def _tabla_en_resultado(page):
@@ -532,10 +560,11 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
     def _buscar_input_datatables(page):
         # Varias posibilidades del input global de búsqueda
         sel_list = [
-            "div.dataTables_wrapper div.dataTables_filter input[type='search']",
+            "#resultado div.dataTables_wrapper div.dataTables_filter input[type='search']",
             "#resultado .dataTables_filter input[type='search']",
+            "div.dataTables_wrapper div.dataTables_filter input[type='search']",
             "div.dataTables_filter input",
-            "input[type='search']"
+            "input[type='search']",
         ]
         for sel in sel_list:
             loc = page.locator(sel)
@@ -551,7 +580,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
         if not t:
             return None
         try:
-            # Asegura que haya filas
             page.wait_for_selector("#resultado table tbody tr", timeout=8000)
         except Exception:
             pass
@@ -571,7 +599,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
         page.goto(URL_COSTOS_TIEMPO_REAL, wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_load_state("networkidle")
 
-        # Guarda HTML por si acaso
+        # Volcado HTML inicial
         try:
             with open("html_main.html", "w", encoding="utf-8") as f:
                 f.write(page.content())
@@ -591,7 +619,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
                 opts = sel.locator("option")
                 n = opts.count()
                 if n > 0:
-                    # última opción con value no vacío
                     val = None
                     for j in range(n - 1, -1, -1):
                         v = opts.nth(j).get_attribute("value")
@@ -603,10 +630,9 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
         except Exception:
             pass
 
-        # Asegura filtro por defecto si existe #cbDefecto
+        # Asegura filtro por defecto si existe #cbDefecto (S = Barras > 138 kV)
         try:
             if page.locator("#cbDefecto").count() > 0:
-                # 'S' = Barras mayores a 138 KV según versiones
                 page.select_option("#cbDefecto", value="S")
         except Exception:
             pass
@@ -623,15 +649,19 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
             browser.close()
             raise RuntimeError("No se pudo abrir la pestaña 'Datos'.")
 
-        page.wait_for_timeout(900)
-        _screenshot(page, "step4_tab_datos.png")
-
-        # Esperar tabla
-        tabla = _tabla_en_resultado(page)
-        if not tabla:
+        # Espera a que se dibuje alguna tabla en #resultado (o DataTables)
+        try:
+            page.wait_for_function(
+                """() => document.querySelector('#resultado table tbody tr')
+                       || document.querySelector('#resultado .dataTables_wrapper')""",
+                timeout=15000
+            )
+        except Exception:
             _screenshot(page, "step5_no_table.png")
             browser.close()
             raise RuntimeError("No se encontró ninguna tabla en la pestaña 'Datos'.")
+
+        _screenshot(page, "step4_tab_datos.png")
 
         # Si existe input de búsqueda → úsalo
         buscador = _buscar_input_datatables(page)
@@ -670,11 +700,11 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
             else:
                 # intenta navegar por la paginación
                 def _hay_siguiente():
-                    # varios selectores posibles
                     sels = [
                         ".dataTables_paginate .paginate_button.next:not(.disabled)",
                         "a.paginate_button.next:not(.disabled)",
-                        "a:has-text('Siguiente'):not(.disabled)"
+                        "a:has-text('Siguiente'):not(.disabled)",
+                        "a:has-text('>'):not(.disabled)"
                     ]
                     for s in sels:
                         try:
@@ -773,6 +803,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=90000):
         ts = ts.tz_localize(TZ)
 
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
+
 
 
 
