@@ -347,44 +347,91 @@ def leer_tabla_html(html: str) -> pd.DataFrame:
 
 def leer_tabla_html_desde_frames(page) -> pd.DataFrame:
     """
-    Intenta leer la tabla desde el frame principal y, si no, desde todos los iframes.
-    Además deja artefactos de debug: html_main.html y frame_*.html
+    Busca tablas reales (<table>) en el documento principal y en todos los iframes.
+    Guarda artefactos de debug: html_main.html, frame_*.html y frame*_table*.html
+    Devuelve el primer DataFrame que tenga columnas de Barra/Nodo y CM.
     """
-    # Dump del HTML principal para debug
+    import io
+
+    def _df_es_valido(df: pd.DataFrame) -> bool:
+        cols = [str(c).strip().lower() for c in df.columns]
+        tiene_barra = any(("barra" in c) or ("nodo" in c) for c in cols)
+        tiene_cm = any(("cm" in c) or ("costo" in c) for c in cols)
+        return tiene_barra and tiene_cm
+
+    # 0) volcado del HTML principal
     try:
         html_main = page.content()
         with open("html_main.html", "w", encoding="utf-8") as f:
             f.write(html_main)
-        # Intento directo en el main
-        try:
-            df = leer_tabla_html(html_main)
-            if df is not None and not df.empty:
-                return df
-        except Exception:
-            pass
     except Exception:
         pass
 
-    # Recorrer todos los frames y guardar su HTML
-    found = None
-    for i, fr in enumerate(page.frames):
+    # 1) helper: intenta leer todas las <table> de un frame dado
+    def _probar_frame(fr, prefijo: str):
+        out_df = None
         try:
-            h = fr.content()
-            with open(f"frame_{i}.html", "w", encoding="utf-8") as f:
-                f.write(h)
+            # esperamos a que aparezca al menos alguna tabla (si existe)
             try:
-                df = leer_tabla_html(h)
-                if df is not None and not df.empty:
-                    found = df
-                    break
+                fr.wait_for_selector("table", timeout=6000)
             except Exception:
-                continue
+                # puede no haber tablas en este frame; seguimos igual
+                pass
+
+            tablas = fr.locator("table")
+            n = 0
+            try:
+                n = tablas.count()
+            except Exception:
+                n = 0
+
+            for i in range(n):
+                try:
+                    outer = tablas.nth(i).evaluate("el => el.outerHTML")
+                    fn = f"{prefijo}_table{i}.html"
+                    with open(fn, "w", encoding="utf-8") as f:
+                        f.write(outer)
+
+                    # Parsear SOLO esa tabla
+                    try:
+                        dflist = pd.read_html(io.StringIO(outer))
+                    except Exception:
+                        dflist = []
+
+                    for dfx in dflist:
+                        if _df_es_valido(dfx) and not dfx.empty:
+                            return dfx
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out_df
+
+    # 2) primero probar el main frame
+    df = _probar_frame(page, "main")
+    if df is not None and not df.empty:
+        return df
+
+    # 3) recorrer todos los frames
+    frames = page.frames
+    for idx, fr in enumerate(frames):
+        try:
+            # dump completo del frame para debug
+            try:
+                h = fr.content()
+                with open(f"frame_{idx}.html", "w", encoding="utf-8") as f:
+                    f.write(h)
+            except Exception:
+                pass
+
+            df = _probar_frame(fr, f"frame{idx}")
+            if df is not None and not df.empty:
+                return df
         except Exception:
             continue
 
-    if found is not None:
-        return found
     raise RuntimeError("No se encontró una tabla de Datos en ninguno de los frames.")
+
 
 
 def _norm_barra(s: str) -> str:
