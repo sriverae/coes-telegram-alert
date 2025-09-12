@@ -470,76 +470,185 @@ def set_fecha_hoy_y_ultima_hora(page):
 
 def obtener_ultimo_costo_por_export(timeout_ms=120000):
     """
-    Flujo robusto (UI pública):
-      - URL correcta /mercadomayorista/.../index
-      - Cierra modal "Aviso"
-      - FECHA = hoy (dd/mm/yyyy, America/Lima) + HORA = última disponible
-      - Click en Buscar
-      - Abre 'Datos'
-      - Filtra por BARRA_BUSCADA (input DataTables) o recorre paginación
-      - Devuelve último registro por Hora
-    Guarda step*.png y datos_tabla.html para debug.
+    Flujo robusto para la página:
+      - Cierra modal "Aviso".
+      - FECHA = hoy (dd/mm/yyyy, America/Lima) con change/blur.
+      - HORA = última opción HH:MM disponible (tras poblar opciones).
+      - Buscar → Datos.
+      - Usa buscador DataTables si existe; si no, recorre paginación.
+      - Devuelve último registro por Hora.
+    También guarda step*.png y datos_tabla.html para debug.
     """
     from io import StringIO
 
     def _screenshot(page, name):
-        try:
-            page.screenshot(path=name)
-        except Exception:
-            pass
+        try: page.screenshot(path=name)
+        except Exception: pass
 
     def _click_possibles(page, textos, timeout=7000):
         for t in textos:
             try:
                 page.get_by_role("button", name=re.compile(t, re.I)).click(timeout=timeout); return True
-            except Exception:
-                pass
+            except Exception: pass
             try:
                 page.get_by_text(re.compile(t, re.I)).first.click(timeout=timeout); return True
-            except Exception:
-                pass
+            except Exception: pass
             try:
                 page.locator(f"button:has-text('{t}')").first.click(timeout=timeout); return True
-            except Exception:
-                pass
-            try:
-                page.locator(f"a:has-text('{t}')").first.click(timeout=timeout); return True
-            except Exception:
-                pass
+            except Exception: pass
             try:
                 page.locator(f"input[type='button'][value*='{t}']").first.click(timeout=timeout); return True
-            except Exception:
-                pass
+            except Exception: pass
+            try:
+                page.locator(f"a:has-text('{t}')").first.click(timeout=timeout); return True
+            except Exception: pass
         return False
 
+    # --- helpers fecha/hora (clave del fix) ---
     def _cerrar_aviso(page):
         _click_possibles(page, [r"^Aceptar$", "Aceptar", r"×", r"X"])
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(250)
+
+    def _set_fecha_hoy_ddmmyyyy(page):
+        hoy = datetime.now(TZ).strftime("%d/%m/%Y")
+        # intenta inputs típicos de fecha + fallback por label
+        candidates = ["#txtFecha", "#TxtFecha", "#fecha",
+                      "input[name='fecha']", "input[placeholder*='Fecha' i]"]
+        fecha = None
+        for sel in candidates:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    fecha = loc.first
+                    break
+            except Exception:
+                pass
+        if not fecha:
+            try:
+                fecha = page.locator("xpath=//label[contains(normalize-space(.),'Fecha')]/following::input[1]")
+            except Exception:
+                return False
+
+        try:
+            fecha.click()
+            fecha.fill("")               # limpiar por si hay máscara
+            fecha.type(hoy, delay=20)
+            # dispara eventos para que el sitio repueble HORAS
+            page.evaluate("(el)=>el.dispatchEvent(new Event('change',{bubbles:true}))", fecha)
+            fecha.press("Enter")
+            page.wait_for_timeout(250)
+            return True
+        except Exception:
+            return False
+
+    def _wait_horas_pobladas(page, timeout=7000):
+        # espera a que el combo de hora exista y tenga opciones HH:MM
+        return page.wait_for_function(
+            """() => {
+                const sel = document.querySelector('#cbHoras')
+                          || document.querySelector("select[name='hora']")
+                          || Array.from(document.querySelectorAll('select')).find(s =>
+                               Array.from(s.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent).trim())));
+                if (!sel) return false;
+                const ok = Array.from(sel.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent).trim()));
+                return ok && !sel.disabled;
+            }""",
+            timeout=timeout
+        )
+
+    def _set_ultima_hora(page):
+        # elige la HH:MM más tardía (última) del combo real de hora
+        sel = None
+        for css in ["#cbHoras", "select[name='hora']"]:
+            try:
+                loc = page.locator(css)
+                if loc.count() > 0:
+                    sel = loc.first
+                    break
+            except Exception:
+                pass
+        if not sel:
+            # búsqueda heurística: primer <select> con opciones HH:MM
+            try:
+                selects = page.locator("select")
+                n = selects.count()
+            except Exception:
+                n = 0
+            for i in range(n):
+                cand = selects.nth(i)
+                try:
+                    texts = [t.strip() for t in cand.locator("option").all_inner_texts()]
+                    if any(re.match(r"^\d{1,2}:\d{2}$", t) for t in texts):
+                        sel = cand
+                        break
+                except Exception:
+                    pass
+        if not sel:
+            return False
+
+        # seleccionar la más grande
+        try:
+            opts = sel.locator("option")
+            cnt = opts.count()
+        except Exception:
+            cnt = 0
+        best_label, best_value = None, None
+        best_score = -1
+        for j in range(cnt):
+            try:
+                txt = opts.nth(j).inner_text().strip()
+                val = (opts.nth(j).get_attribute("value") or "").strip()
+                hhmm = txt if re.match(r"^\d{1,2}:\d{2}$", txt) else (val if re.match(r"^\d{1,2}:\d{2}$", val) else None)
+                if not hhmm: continue
+                h, m = hhmm.split(":"); score = int(h) * 60 + int(m)
+                if score > best_score:
+                    best_score, best_label, best_value = score, txt, val
+            except Exception:
+                continue
+        if best_score < 0:
+            return False
+
+        try:
+            if best_value:
+                sel.select_option(best_value)
+            else:
+                sel.select_option(label=best_label)
+            # verifica que quedó seteado
+            page.wait_for_function(
+                """(exp) => {
+                    const sel = document.querySelector('#cbHoras') || document.querySelector("select[name='hora']");
+                    if (!sel) return false;
+                    const t = (sel.value || sel.options[sel.selectedIndex]?.text || '').trim();
+                    return t === exp;
+                }""",
+                f"{best_label if best_label else best_value}",
+                timeout=3000
+            )
+            return True
+        except Exception:
+            return False
 
     def _abrir_datos(page):
-        if _click_possibles(page, [r"^Datos$", "Datos"], timeout=5000):
-            return True
+        if _click_possibles(page, [r"^Datos$", "Datos"], timeout=5000): return True
         try:
-            page.locator("[aria-controls*=Datos], [data-fuente='datos'], [data-target*=Datos]").first.click(timeout=4000)
+            page.locator("[data-fuente='datos'], [aria-controls*=Datos], [data-target*=Datos]").first.click(timeout=4000)
             return True
         except Exception:
             return False
 
     def _buscar_input_datatables(page):
-        candidatos = [
+        for sel in [
             "div.dataTables_wrapper div.dataTables_filter input[type='search']",
             "#resultado .dataTables_filter input[type='search']",
             "div.dataTables_filter input",
             "input[aria-label='Search']",
-            "xpath=//*[contains(normalize-space(.),'Mostrar número de filas')]/following::input[1]"
-        ]
-        for sel in candidatos:
+            "xpath=//*[contains(normalize-space(.),'Mostrar número de filas')]/following::input[1]",
+        ]:
             try:
                 loc = page.locator(sel)
-                if loc.count() > 0 and loc.first.is_visible():
-                    return loc.first
+                if loc.count() > 0 and loc.first.is_visible(): return loc.first
             except Exception:
-                continue
+                pass
         return None
 
     def _tabla_html(page):
@@ -549,17 +658,16 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
             pass
         try:
             t = page.locator("#resultado table").first
-            if t.count() == 0:
-                t = page.locator("table").first
+            if t.count() == 0: t = page.locator(".dataTables_wrapper table").first
             return t.evaluate("el => el.outerHTML")
         except Exception:
             return None
 
     def _tabla_contiene_barra(html, barra):
-        if not html:
-            return False
+        if not html: return False
         return (barra or "").upper().replace(" ", "") in re.sub(r"\s+", "", html.upper())
 
+    # -------------------- navegación --------------------
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1366, "height": 900})
@@ -571,20 +679,36 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         _cerrar_aviso(page)
         _screenshot(page, "step2_modal_closed.png")
 
-        # === FECHA HOY (dd/mm/yyyy) + ÚLTIMA HORA ===
-        try:
-            set_fecha_hoy_y_ultima_hora(page)
-        except Exception:
-            pass
-        page.wait_for_timeout(300)
+        # FECHA → HORA (esperando a que se repueble el combo)
+        _set_fecha_hoy_ddmmyyyy(page)
+        try: _wait_horas_pobladas(page, timeout=8000)
+        except Exception: pass
+        _set_ultima_hora(page)
+        page.wait_for_timeout(250)
 
-        # Solo 'Buscar' (nunca 'Consultar')
+        # Buscar
         _click_possibles(page, [r"^Buscar$", "Buscar"])
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(600)
+
+        # si Hora quedó vacía o aparece el mensaje de error, re-selecciona y reintenta una vez
+        try:
+            hora_sel = page.locator("#cbHoras, select[name='hora']").first
+            hora_val = ""
+            try: hora_val = (hora_sel.input_value() or "").strip()
+            except Exception: pass
+            error_flag = page.locator("text=/Se ha producido un error/i").count() > 0
+            if (not hora_val or re.match(r"^Seleccione", hora_val, re.I)) or error_flag:
+                _set_ultima_hora(page)
+                _click_possibles(page, [r"^Buscar$", "Buscar"])
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(600)
+        except Exception:
+            pass
+
         _screenshot(page, "step3_clicked_buscar.png")
 
-        # Abrir 'Datos'
+        # Datos
         if not _abrir_datos(page):
             _screenshot(page, "step4_no_datos_tab.png")
             browser.close()
@@ -592,36 +716,23 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         page.wait_for_timeout(600)
         _screenshot(page, "step4_tab_datos.png")
 
-        # Espera tabla/estado vacío
-        try:
-            page.wait_for_selector("#resultado table tbody tr, #resultado .dataTables_empty, .dataTables_wrapper table", timeout=8000)
-        except Exception:
-            _screenshot(page, "step5_no_table.png")
-            browser.close()
-            raise RuntimeError("No se encontró ninguna tabla en 'Datos'.")
-
-        # Filtro o paginación
-        buscador = _buscar_input_datatables(page)
-        html_tabla = None
-
+        # Buscador / paginación
+        buscador, html_tabla = _buscar_input_datatables(page), None
         if buscador is not None:
             try:
                 buscador.fill("")
                 buscador.type(BARRA_BUSCADA, delay=18)
                 page.wait_for_function(
-                    """(texto) => {
-                        const u = (texto||'').toUpperCase();
-                        const wrap = document.querySelector('#resultado') || document;
-                        const t = wrap.querySelector('table'); if(!t) return false;
-                        const rows = t.querySelectorAll('tbody tr'); if(!rows.length) return false;
-                        return Array.from(rows).some(r => r.innerText.toUpperCase().includes(u));
-                    }""",
-                    BARRA_BUSCADA,
-                    timeout=9000
+                    """(texto)=>{const u=(texto||'').toUpperCase();
+                       const wrap=document.querySelector('#resultado')||document;
+                       const t=wrap.querySelector('table'); if(!t) return false;
+                       const rows=t.querySelectorAll('tbody tr');
+                       return Array.from(rows).some(r=>r.innerText.toUpperCase().includes(u));}""",
+                    BARRA_BUSCADA, timeout=9000
                 )
                 html_tabla = _tabla_html(page)
             except Exception:
-                pass  # caer a paginación
+                pass
 
         if not html_tabla:
             html = _tabla_html(page)
@@ -629,40 +740,32 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
                 html_tabla = html
             else:
                 def _sel_siguiente():
-                    sels = [
+                    for s in [
                         ".dataTables_paginate .paginate_button.next:not(.disabled)",
                         "a.paginate_button.next:not(.disabled)",
                         "a:has-text('Siguiente'):not(.disabled)",
-                        "a:has-text('›')", "a:has-text('»')"
-                    ]
-                    for s in sels:
+                        "a:has-text('›')", "a:has-text('»')",
+                    ]:
                         try:
-                            if page.locator(s).count() > 0 and page.locator(s).first.is_visible():
-                                return s
-                        except Exception:
-                            pass
+                            if page.locator(s).count() > 0 and page.locator(s).first.is_visible(): return s
+                        except Exception: pass
                     return None
 
-                visitas = 0
-                while visitas < 60:
-                    sel_next = _sel_siguiente()
-                    if not sel_next:
-                        break
+                for _ in range(60):
+                    nxt = _sel_siguiente()
+                    if not nxt: break
                     try:
-                        page.locator(sel_next).first.click()
-                        page.wait_for_timeout(500)
+                        page.locator(nxt).first.click(); page.wait_for_timeout(450)
                         html = _tabla_html(page)
                         if _tabla_contiene_barra(html, BARRA_BUSCADA):
-                            html_tabla = html
-                            break
-                        visitas += 1
+                            html_tabla = html; break
                     except Exception:
                         break
 
         if not html_tabla:
-            _screenshot(page, "step8_no_match_table.png")
+            _screenshot(page, "step5_no_table.png")
             browser.close()
-            raise RuntimeError(f"No se encontró '{BARRA_BUSCADA}' en ninguna página de la tabla.")
+            raise RuntimeError("No se encontró ninguna tabla en 'Datos'.")
 
         try:
             with open("datos_tabla.html", "w", encoding="utf-8") as f:
@@ -672,61 +775,45 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
 
         browser.close()
 
-    # === Parseo y último registro ===
+    # ---- Parseo y selección del último registro ----
     tablas = pd.read_html(StringIO(html_tabla))
     if not tablas:
         raise RuntimeError("No se pudo parsear la tabla de 'Datos' a DataFrame.")
-
     df = tablas[0].copy()
 
-    def fcol(pat):
-        return next((c for c in df.columns if re.search(pat, str(c), re.I)), None)
-
+    def fcol(pat): return next((c for c in df.columns if re.search(pat, str(c), re.I)), None)
     col_hora = fcol(r"\bhora\b")
     col_barra = fcol(r"\b(Barra|Nodo|Punto)\b")
     col_cm_en = fcol(r"cm\s*energ")
     col_cm_co = fcol(r"cm\s*conges")
     col_cm_to = fcol(r"(cm\s*total|costo\s*marginal\s*total)")
-
     if not (col_hora and col_barra and col_cm_to):
         raise RuntimeError("No se encontró una tabla con columnas esperadas (Hora/Barra/CM Total).")
 
     df = df.rename(columns={
-        col_hora: "Hora",
-        col_barra: "Barra",
-        col_cm_to: "CM_Total",
+        col_hora: "Hora", col_barra: "Barra", col_cm_to: "CM_Total",
         **({col_cm_en: "CM_Energia"} if col_cm_en else {}),
         **({col_cm_co: "CM_Congestion"} if col_cm_co else {}),
     })
-
-    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
+    for c in ["CM_Energia","CM_Congestion","CM_Total"]:
         if c in df.columns:
-            df[c] = (
-                df[c].astype(str)
-                .str.replace(",", ".", regex=False)
-                .str.extract(r"([-]?\d+(?:\.\d+)?)")[0]
-                .astype(float)
-            )
-
+            df[c] = (df[c].astype(str)
+                         .str.replace(",", ".", regex=False)
+                         .str.extract(r"([-]?\d+(?:\.\d+)?)")[0]
+                         .astype(float))
     df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
+
     df = filtrar_barra_robusto(df, BARRA_BUSCADA)
     if df.empty:
         raise RuntimeError(f"No se obtuvo ningún registro para '{BARRA_BUSCADA}' tras filtrar la tabla.")
-
     df = df.sort_values("ts")
     row = df.iloc[-1]
     energia = float(row["CM_Energia"]) if "CM_Energia" in df.columns else None
     congestion = float(row["CM_Congestion"]) if "CM_Congestion" in df.columns else None
     total = float(row["CM_Total"])
-
     ts = row["ts"]
-    if ts.tzinfo is None:
-        ts = ts.tz_localize(TZ)
-
+    if ts.tzinfo is None: ts = ts.tz_localize(TZ)
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
-
-
-
 
 def ejecutar_iteracion():
     estado = cargar_estado()
