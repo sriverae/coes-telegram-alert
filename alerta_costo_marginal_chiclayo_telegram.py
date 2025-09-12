@@ -7,6 +7,7 @@ v3: Modo ONE-SHOT para GitHub Actions + Persistencia opcional en Gist
 import os, time, json, re, io
 import pandas as pd
 import requests
+import re
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -539,78 +540,121 @@ def obtener_ultimo_costo_por_export(timeout_ms=60000):
         page.wait_for_timeout(900)
         _screenshot(page, "step4_tab_datos.png")
 
-        # 4) Esperar a que DataTables esté listo (wrapper + input de búsqueda)
+        # 4) Ubicar el FRAME que contiene la tabla (si está en iframe) y esperar contenido
+        #    Si no hay iframe, usamos el propio page como "frame".
+        fr = None
+        t0 = time.time()
+        while time.time() - t0 < 20 and fr is None:
+            # prueba: ¿algún frame ya tiene wrapper o tablas?
+            for f in page.frames:
+                try:
+                    if f.locator("div.dataTables_wrapper").count() > 0:
+                        fr = f
+                        break
+                    # fallback: cualquier <table> con pinta de datos
+                    if f.locator("table").count() > 0:
+                        fr = f
+                        break
+                except Exception:
+                    pass
+            if fr is None:
+                page.wait_for_timeout(500)
+
+        if fr is None:
+            # no encontramos iframe con tabla; intentamos en el main page
+            fr = page
+
+        # Esperar a que aparezca algun wrapper o tabla dentro del frame elegido
         try:
-            page.wait_for_selector("div.dataTables_wrapper", timeout=15000)
+            fr.wait_for_selector("div.dataTables_wrapper, table", timeout=15000)
         except Exception:
             _screenshot(page, "step5_no_wrapper.png")
+            # volcado de todos los frames para debug
+            for idx, f in enumerate(page.frames):
+                try:
+                    with open(f"frame_{idx}.html", "w", encoding="utf-8") as g:
+                        g.write(f.content())
+                except Exception:
+                    pass
             browser.close()
-            raise RuntimeError("No se encontró el contenedor de DataTables.")
+            raise RuntimeError("No se encontró el contenedor/tabla de DataTables (posible iframe sin cargar).")
 
-        # Localizador ROBUSTO del buscador global de DataTables
-        buscador = None
-        # a) patrón clásico
-        loc = page.locator("div.dataTables_wrapper div.dataTables_filter input[type='search']")
-        if loc.count() > 0:
-            buscador = loc.first
-        # b) variaciones
-        if buscador is None:
-            loc = page.locator("div.dataTables_filter input")
-            if loc.count() > 0:
-                buscador = loc.first
-        if buscador is None:
-            # Buscar el input dentro de la etiqueta del filtro (label: Buscar:)
-            loc = page.locator("div.dataTables_filter label").locator("input")
-            if loc.count() > 0:
-                buscador = loc.first
-
-        if buscador is None:
-            _screenshot(page, "step5_no_search.png")
-            browser.close()
-            raise RuntimeError("No se encontró la caja de búsqueda de DataTables.")
-
-        # 5) Filtrar por la barra objetivo (atraviesa TODA la paginación)
+        # 5) Localizar el buscador global dentro del frame y filtrar
         texto_buscar = BARRA_BUSCADA
-        buscador.fill("")               # limpia
+        buscador = None
+        for sel in [
+            "div.dataTables_wrapper div.dataTables_filter input[type='search']",
+            "div.dataTables_filter input",
+            "label:has-text('Buscar') input",
+            "input[type='search']",
+        ]:
+            try:
+                loc = fr.locator(sel)
+                if loc.count() > 0:
+                    buscador = loc.first
+                    break
+            except Exception:
+                pass
+
+        if not buscador:
+            _screenshot(page, "step5_no_search.png")
+            # dump html del frame para inspección
+            try:
+                with open("html_post_datos.html", "w", encoding="utf-8") as f:
+                    f.write(fr.content())
+            except Exception:
+                pass
+            browser.close()
+            raise RuntimeError("No se encontró la caja de búsqueda de DataTables (posible cambio de UI).")
+
+        buscador.fill("")
         buscador.type(texto_buscar, delay=25)
         _screenshot(page, "step6_typed_filter.png")
 
-        # Espera a que la tabla muestre al menos una fila que contenga la barra
+        # Esperar a que alguna fila contenga la barra buscada (dentro del frame)
         try:
-            page.wait_for_function(
+            fr.wait_for_function(
                 """(barra) => {
-                    const wrap = document.querySelector('div.dataTables_wrapper');
-                    if (!wrap) return false;
+                    const wrap = document.querySelector('div.dataTables_wrapper') || document;
                     const rows = wrap.querySelectorAll('table tbody tr');
                     if (!rows.length) return false;
-                    const upper = barra.toUpperCase();
-                    return Array.from(rows).some(r => r.innerText.toUpperCase().includes(upper));
+                    const upper = String(barra || '').toUpperCase();
+                    return Array.from(rows).some(r => (r.innerText || '').toUpperCase().includes(upper));
                 }""",
                 texto_buscar,
-                timeout=10000
+                timeout=12000
             )
         except Exception:
             _screenshot(page, "step6_wait_for_filter_timeout.png")
-            # seguimos, igual extraemos HTML para ver qué hay
+            # seguimos; igual intentamos extraer la tabla para ver qué hay
 
-
-        # 6) Localizar la tabla (header con Barra/Nodo)
+        # 6) Localizar la tabla dentro del frame (con thead/filas)
         tabla = None
-        try:
-            tabla = page.locator("div.dataTables_wrapper table").filter(
-                has=page.locator("thead")
-            ).first
-            # asegurar que hay filas
-            page.wait_for_selector("div.dataTables_wrapper table tbody tr", timeout=8000)
-        except Exception:
-            tabla = None
+        for loc in [
+            fr.locator("div.dataTables_wrapper table.dataTable"),
+            fr.locator("div.dataTables_wrapper table"),
+            fr.locator("table"),
+        ]:
+            try:
+                if loc.count() > 0:
+                    # asegurar que haya filas en tbody
+                    fr.wait_for_selector("table tbody tr", timeout=8000)
+                    tabla = loc.first
+                    break
+            except Exception:
+                pass
 
-        if not tabla or tabla.count() == 0:
+        if not tabla:
             _screenshot(page, "step7_no_table.png")
+            try:
+                with open("html_post_datos.html", "w", encoding="utf-8") as f:
+                    f.write(fr.content())
+            except Exception:
+                pass
             browser.close()
             raise RuntimeError("No se encontró la tabla de 'Datos' después del filtro.")
 
-        # 7) Extraer HTML de la tabla ya filtrada y guardarlo
+        # 7) Extraer HTML de la tabla filtrada y guardarlo
         html_tabla = tabla.evaluate("el => el.outerHTML")
         try:
             with open("datos_tabla.html", "w", encoding="utf-8") as f:
