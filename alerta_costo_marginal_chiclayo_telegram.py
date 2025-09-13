@@ -7,7 +7,7 @@ v3: Modo ONE-SHOT para GitHub Actions + Persistencia opcional en Gist
 import os, time, json, re, io
 import pandas as pd
 import requests
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 try:
@@ -40,26 +40,12 @@ URL_COSTOS_TIEMPO_REAL = os.getenv(
     "https://www.coes.org.pe/Portal/mercadomayorista/costosmarginales/index"
 )
 
-# -------------------- util horario --------------------
-
 def _parse_hhmm(s: str):
     try:
         hh, mm = s.split(":")
         return dtime(int(hh), int(mm))
     except Exception:
         return None
-
-def _floor_to_30(now_dt: datetime) -> str:
-    mins = now_dt.hour * 60 + now_dt.minute
-    mins //= 30
-    mins *= 30
-    h, m = divmod(mins, 60)
-    return f"{h:02d}:{m:02d}"
-
-def _minus_30_str(hhmm: str) -> str:
-    h, m = map(int, hhmm.split(":"))
-    dt = datetime(2000, 1, 1, h, m) - timedelta(minutes=30)
-    return f"{dt.hour:02d}:{dt.minute:02d}"
 
 def en_horario_sonido(ahora: datetime) -> bool:
     if not SILENCIO_DESDE or not SILENCIO_HASTA:
@@ -74,7 +60,7 @@ def en_horario_sonido(ahora: datetime) -> bool:
     else:
         return not (t >= t_desde or t < t_hasta)
 
-# -------------------- gist / estado --------------------
+# -------------------- Gist helpers --------------------
 
 def _gist_headers():
     return {"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"} if GIST_TOKEN else {}
@@ -145,7 +131,7 @@ def enviar_telegram(mensaje: str):
     r.raise_for_status()
     return r.json()
 
-# -------------------- parseo excel/html (sin cambios) --------------------
+# -------------------- Parsing helpers --------------------
 
 def _find_header_row(raw: pd.DataFrame) -> int:
     sraw = raw.astype(str)
@@ -188,7 +174,7 @@ def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
     if col_cm_cong:    rename_map[col_cm_cong]    = "CM_Congestion"
     df = df.rename(columns=rename_map)
 
-    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
+    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]]:
         if c in df.columns:
             df[c] = (
                 df[c].astype(str)
@@ -258,7 +244,7 @@ def leer_tabla_html(html: str) -> pd.DataFrame:
 
     raise RuntimeError("No se encontró una tabla HTML con columnas esperadas (Barra/Nodo y CM).")
 
-# -------------------- filtros & normalización barra --------------------
+# -------------------- Normalización barra --------------------
 
 def _norm_barra(s: str) -> str:
     if s is None:
@@ -288,20 +274,17 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
     con220 = candidatos[candidatos["Barra_norm"].str.contains("220", na=False)]
     return con220 if not con220.empty else candidatos
 
-# -------------------- scraping principal --------------------
+# ==================== NAVEGACIÓN / WEB ====================
 
 def obtener_ultimo_costo_por_export(timeout_ms=120000):
     """
     Flujo robusto:
-      1) Cierra modal "Aviso".
-      2) Setea FECHA = hoy (dd/mm/yyyy, America/Lima).
-      3) Abre el combo de HORA, toma screenshot del desplegable, lee opciones y
-         elige la más cercana hacia atrás (30 min). Si no hay, intenta -30, -60, … (hasta 2 h).
-      4) Buscar → Datos. Si falla, retrocede 30 min una vez y reintenta.
-      5) Filtra/pagina y devuelve último registro por Hora.
-    Guarda: step1_loaded.png, step2_modal_closed.png,
-            step2a_horas_dropdown.png, step2b_hora_seleccionada.png,
-            step3_clicked_buscar.png, step4_tab_datos.png, datos_tabla.html
+      - Cierra modal "Aviso".
+      - FECHA = hoy (dd/mm/yyyy) y dispara change/input/blur.
+      - Abre el dropdown de HORA, lista opciones, screenshot (step2a_horas_dropdown.png).
+      - Selecciona la media hora más cercana por debajo de la hora actual (fallback bajando).
+      - Buscar → Datos, con reintento si aparece "Se ha producido un error" o la hora queda vacía.
+      - Busca la barra con buscador/paginación y parsea la tabla final.
     """
     from io import StringIO
 
@@ -328,119 +311,180 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
             except Exception: pass
         return False
 
-    # ---- helpers fecha/hora ----
+    # ---------- helpers fecha / hora ----------
 
     def _cerrar_aviso(page):
         _click_possibles(page, [r"^Aceptar$", "Aceptar", r"×", r"X"])
         page.wait_for_timeout(250)
 
-    def _set_fecha_hoy_ddmmyyyy(page):
-        hoy = datetime.now(TZ).strftime("%d/%m/%Y")
-        fecha = None
-        for sel in ["#txtFecha", "#TxtFecha", "#fecha", "input[name='fecha']", "input[placeholder*='Fecha' i]"]:
+    def _fecha_input_locator(page):
+        for sel in ["#txtFecha", "#TxtFecha", "#fecha",
+                    "input[name='fecha']", "input[placeholder*='Fecha' i]",
+                    "xpath=//label[contains(normalize-space(.),'Fecha')]/following::input[1]"]:
             try:
                 loc = page.locator(sel)
-                if loc.count() > 0:
-                    fecha = loc.first
-                    break
-            except Exception:
-                pass
-        if not fecha:
-            try:
-                fecha = page.locator("xpath=//label[contains(normalize-space(.),'Fecha')]/following::input[1]")
-            except Exception:
-                return False
-        try:
-            fecha.click()
-            fecha.fill("")
-            fecha.type(hoy, delay=15)
-            page.evaluate("(el)=>el.dispatchEvent(new Event('change',{bubbles:true}))", fecha)
-            fecha.press("Enter")
-            page.wait_for_timeout(200)
-            return True
-        except Exception:
-            return False
-
-    def _find_hora_select(page):
-        # primero el que está junto a la etiqueta "Hora"
-        try:
-            loc = page.locator("xpath=//label[contains(normalize-space(.),'Hora')]/following::select[1]")
-            if loc.count() > 0:
-                return loc.first
-        except Exception:
-            pass
-        # ids/ names comunes
-        for css in ["#cbHoras", "select[name='hora']"]:
-            try:
-                loc = page.locator(css)
                 if loc.count() > 0:
                     return loc.first
             except Exception:
                 pass
-        # heurístico: primer select con opciones HH:MM
-        try:
-            selects = page.locator("select")
-            n = selects.count()
-        except Exception:
-            n = 0
-        for i in range(n):
-            cand = selects.nth(i)
-            try:
-                texts = [t.strip() for t in cand.locator("option").all_inner_texts()]
-                if any(re.match(r"^\d{1,2}:\d{2}$", t) for t in texts):
-                    return cand
-            except Exception:
-                pass
         return None
 
-    def _get_horas(sel) -> list[str]:
+    def _set_fecha_hoy_ddmmyyyy(page):
+        hoy = datetime.now(TZ).strftime("%d/%m/%Y")
+        inp = _fecha_input_locator(page)
+        if not inp: return False
         try:
-            opts = sel.locator("option")
-            n = opts.count()
+            inp.click()
+            inp.fill("")
+            inp.type(hoy, delay=20)
+            # forzar que repueble horas
+            page.evaluate("(el)=>{el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.blur();}", inp)
+            page.wait_for_timeout(300)
+            return True
         except Exception:
-            n = 0
-        out = []
-        for i in range(n):
-            try:
-                txt = (opts.nth(i).inner_text() or "").strip()
-                val = (opts.nth(i).get_attribute("value") or "").strip()
-                pick = None
-                for cand in (txt, val):
-                    m = re.search(r"(\d{1,2}):(\d{2})", cand)
-                    if m:
-                        pick = f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
-                        break
-                if pick:
-                    out.append(pick)
-            except Exception:
-                continue
-        return sorted(set(out))  # orden ascendente
+            return False
 
-    def _select_hora(sel, hhmm: str) -> bool:
-        # intentar por value, label y, si falla, forzar selectedIndex por JS
+    def _wait_horas_pobladas(page, timeout=7000):
+        return page.wait_for_function(
+            """() => {
+                const sel = document.querySelector('#cbHoras')
+                    || document.querySelector("select[name='hora']")
+                    || Array.from(document.querySelectorAll('select')).find(s =>
+                        Array.from(s.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent||'').trim())));
+                if (!sel || sel.disabled) return false;
+                const ok = Array.from(sel.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent||'').trim()));
+                return ok;
+            }""",
+            timeout=timeout
+        )
+
+    def _abrir_dropdown_horas_y_listar(page):
+        # localiza el select de hora y lo abre (para asegurar que hay opciones)
+        sel = None
+        for css in ["#cbHoras", "select[name='hora']"]:
+            try:
+                loc = page.locator(css)
+                if loc.count() > 0:
+                    sel = loc.first
+                    break
+            except Exception:
+                pass
+        if not sel:
+            # heurística: primer select con opciones HH:MM
+            try:
+                selects = page.locator("select")
+                n = selects.count()
+                for i in range(n):
+                    cand = selects.nth(i)
+                    texts = [t.strip() for t in cand.locator("option").all_inner_texts()]
+                    if any(re.match(r"^\d{1,2}:\d{2}$", t) for t in texts):
+                        sel = cand
+                        break
+            except Exception:
+                pass
+        if not sel:
+            return None, []
+
         try:
-            sel.select_option(value=hhmm)
-            return True
+            sel.click()  # abre el desplegable
+            _screenshot(page, "step2a_horas_dropdown.png")
         except Exception:
             pass
+
+        # leer opciones (value y texto)
         try:
-            sel.select_option(label=hhmm)
-            return True
-        except Exception:
-            pass
-        # selección manual por índice
-        try:
-            idx = sel.locator("option").evaluate_all(
-                "(opts, target) => opts.findIndex(o => (o.value||o.textContent).trim().includes(target))",
-                hhmm
+            opciones = page.evaluate(
+                """(s) => {
+                    const el = s;
+                    const reg = /^\\d{1,2}:\\d{2}$/;
+                    return Array.from(el.options)
+                                .map(o => ({value:(o.value||'').trim(), text:(o.textContent||'').trim()}))
+                                .filter(o => reg.test(o.value)||reg.test(o.text));
+                }""",
+                sel
             )
-            if idx is not None and idx >= 0:
-                page = sel.page
-                page.evaluate(
-                    "(s,i)=>{s.selectedIndex=i;s.dispatchEvent(new Event('change',{bubbles:true}));}",
-                    sel, idx
-                )
-                return True
+        except Exception:
+            opciones = []
+
+        return sel, opciones
+
+    def _minutos(hhmm: str) -> int:
+        h, m = hhmm.split(":")
+        return int(h)*60 + int(m)
+
+    def _set_hora_mas_cercana(page, sel, opciones):
+        """Elige la media hora más cercana por debajo de 'ahora' (Lima).
+        Si esa no existe, baja a la anterior hasta encontrar una;
+        si nada cumple, usa la mayor disponible."""
+        if not opciones:
+            return False
+        ahora = datetime.now(TZ)
+        base = (ahora.hour*60 + ahora.minute) // 30 * 30  # redondeo hacia abajo a múltiplo de 30
+        # Genera candidatos descendentes: base, base-30, base-60, ...
+        candidatos = []
+        mins_opcs = sorted({_minutos((o["value"] or o["text"])) for o in opciones})
+        # lista de candidatos en minutos
+        for k in range(0, 24*60, 30):
+            m = base - 30*k
+            if m < 0:
+                break
+            candidatos.append(m)
+        # busca el primero que exista
+        elegido_min = None
+        for cand in candidatos:
+            if cand in mins_opcs:
+                elegido_min = cand
+                break
+        if elegido_min is None:
+            elegido_min = max(mins_opcs)  # fallback: el más grande
+
+        hh = elegido_min // 60
+        mm = elegido_min % 60
+        target = f"{hh:02d}:{mm:02d}"
+
+        # intenta seleccionar por value o por label
+        try:
+            # ¿hay option cuyo value == target?
+            tiene_value = any((o["value"] == target) for o in opciones)
+            if tiene_value:
+                sel.select_option(value=target)
+            else:
+                sel.select_option(label=target)
+
+            # verifica que quedó marcado
+            page.wait_for_function(
+                """(exp, s) => {
+                    const el = s;
+                    const v = (el.value || el.options[el.selectedIndex]?.text || '').trim();
+                    return v === exp;
+                }""",
+                target, sel, timeout=3000
+            )
+            return True
+        except Exception:
+            return False
+
+    def _retroceder_media_hora(page, sel):
+        """Si hay error, retrocede a la opción anterior disponible (una media hora menos)."""
+        try:
+            opciones = page.evaluate(
+                """(s) => Array.from(s.options).map(o => (o.value||o.textContent||'').trim())""",
+                sel
+            )
+            opciones = [o for o in opciones if re.match(r"^\d{1,2}:\d{2}$", o)]
+            if not opciones:
+                return False
+            actual = page.evaluate("""(s)=> (s.value || s.options[s.selectedIndex]?.text || '').trim()""", sel)
+            if actual in opciones:
+                idx = opciones.index(actual)
+                if idx > 0:
+                    prev = opciones[idx-1]
+                    try:
+                        sel.select_option(value=prev)
+                    except Exception:
+                        sel.select_option(label=prev)
+                    page.wait_for_timeout(200)
+                    return True
         except Exception:
             pass
         return False
@@ -496,72 +540,38 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         _cerrar_aviso(page)
         _screenshot(page, "step2_modal_closed.png")
 
-        # 1) FECHA = hoy (dd/mm/yyyy)
+        # 1) FECHA hoy dd/mm/yyyy  -> repuebla horas
         _set_fecha_hoy_ddmmyyyy(page)
+        try: _wait_horas_pobladas(page, timeout=8000)
+        except Exception: pass
 
-        # 2) HORA → abrir desplegable (screenshot) y elegir la más cercana hacia atrás
-        sel_hora = _find_hora_select(page)
-        if not sel_hora:
+        # 2) Abrir dropdown horas, screenshot y elegir media hora más cercana por debajo
+        sel_hora, opciones = _abrir_dropdown_horas_y_listar(page)
+        if not opciones:
             browser.close()
-            raise RuntimeError("No se encontró el combo de 'Hora' en la página.")
-
-        try:
-            sel_hora.click()  # abrir drop-down
-            page.wait_for_timeout(250)
-            _screenshot(page, "step2a_horas_dropdown.png")
-        except Exception:
-            pass
-
-        horas = _get_horas(sel_hora)
-        try:
-            with open("horas_disponibles.txt", "w", encoding="utf-8") as f:
-                f.write("\n".join(horas))
-        except Exception:
-            pass
-
-        if not horas:
+            raise RuntimeError("No se pudo leer el combo de 'Hora' (sin opciones).")
+        if not _set_hora_mas_cercana(page, sel_hora, opciones):
             browser.close()
-            raise RuntimeError("El combo de 'Hora' no tiene opciones HH:MM disponibles.")
+            raise RuntimeError("No fue posible fijar una hora válida.")
 
-        objetivo = _floor_to_30(datetime.now(TZ))
-        candidatos = [objetivo]
-        # retroceder hasta 4 pasos (2 horas) si hace falta
-        for _ in range(4):
-            candidatos.append(_minus_30_str(candidatos[-1]))
-
-        elegida = next((c for c in candidatos if c in horas), None)
-        if not elegida:
-            # si nada de lo anterior existe, usa la última hora disponible
-            elegida = horas[-1]
-
-        if not _select_hora(sel_hora, elegida):
-            browser.close()
-            raise RuntimeError("No se pudo seleccionar la hora en el combo.")
-
-        page.wait_for_timeout(150)
-        _screenshot(page, "step2b_hora_seleccionada.png")
+        page.wait_for_timeout(250)
 
         # 3) Buscar
         _click_possibles(page, [r"^Buscar$", "Buscar"])
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(600)
 
-        # Si “Se ha producido un error” o no hay tabla → probar 30 min antes una sola vez
-        error_flag = False
+        # 3b) Si hay error o la hora quedó vacía, retroceder media hora y reintentar una vez
         try:
             error_flag = page.locator("text=/Se ha producido un error/i").count() > 0
+            valor_hora = page.locator("#cbHoras, select[name='hora']").first.input_value()
+            if error_flag or not valor_hora:
+                if sel_hora and _retroceder_media_hora(page, sel_hora):
+                    _click_possibles(page, [r"^Buscar$", "Buscar"])
+                    page.wait_for_load_state("networkidle")
+                    page.wait_for_timeout(600)
         except Exception:
             pass
-
-        tabla_ok = _tabla_html(page) is not None
-
-        if (not tabla_ok) or error_flag:
-            # retroceder 30 minutos frente a la elegida (si existe en opciones)
-            prev30 = _minus_30_str(elegida)
-            if prev30 in horas and _select_hora(sel_hora, prev30):
-                _click_possibles(page, [r"^Buscar$", "Buscar"])
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(600)
 
         _screenshot(page, "step3_clicked_buscar.png")
 
@@ -573,7 +583,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         page.wait_for_timeout(600)
         _screenshot(page, "step4_tab_datos.png")
 
-        # 5) Buscador / paginado
+        # 5) Buscador / paginación
         buscador, html_tabla = _buscar_input_datatables(page), None
         if buscador is not None:
             try:
@@ -672,7 +682,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
     if ts.tzinfo is None: ts = ts.tz_localize(TZ)
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
 
-# -------------------- loop / envío --------------------
+# ==================== LOOP ====================
 
 def ejecutar_iteracion():
     estado = cargar_estado()
