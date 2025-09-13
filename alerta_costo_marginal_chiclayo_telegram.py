@@ -174,7 +174,8 @@ def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
     if col_cm_cong:    rename_map[col_cm_cong]    = "CM_Congestion"
     df = df.rename(columns=rename_map)
 
-    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]]:
+    # <-- FIX: quitado el ']' extra en el for
+    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
         if c in df.columns:
             df[c] = (
                 df[c].astype(str)
@@ -359,7 +360,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         )
 
     def _abrir_dropdown_horas_y_listar(page):
-        # localiza el select de hora y lo abre (para asegurar que hay opciones)
         sel = None
         for css in ["#cbHoras", "select[name='hora']"]:
             try:
@@ -370,7 +370,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
             except Exception:
                 pass
         if not sel:
-            # heurística: primer select con opciones HH:MM
             try:
                 selects = page.locator("select")
                 n = selects.count()
@@ -391,7 +390,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         except Exception:
             pass
 
-        # leer opciones (value y texto)
         try:
             opciones = page.evaluate(
                 """(s) => {
@@ -413,45 +411,35 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         return int(h)*60 + int(m)
 
     def _set_hora_mas_cercana(page, sel, opciones):
-        """Elige la media hora más cercana por debajo de 'ahora' (Lima).
-        Si esa no existe, baja a la anterior hasta encontrar una;
-        si nada cumple, usa la mayor disponible."""
         if not opciones:
             return False
         ahora = datetime.now(TZ)
         base = (ahora.hour*60 + ahora.minute) // 30 * 30  # redondeo hacia abajo a múltiplo de 30
-        # Genera candidatos descendentes: base, base-30, base-60, ...
-        candidatos = []
         mins_opcs = sorted({_minutos((o["value"] or o["text"])) for o in opciones})
-        # lista de candidatos en minutos
+        candidatos = []
         for k in range(0, 24*60, 30):
             m = base - 30*k
             if m < 0:
                 break
             candidatos.append(m)
-        # busca el primero que exista
         elegido_min = None
         for cand in candidatos:
             if cand in mins_opcs:
                 elegido_min = cand
                 break
         if elegido_min is None:
-            elegido_min = max(mins_opcs)  # fallback: el más grande
+            elegido_min = max(mins_opcs)
 
         hh = elegido_min // 60
         mm = elegido_min % 60
         target = f"{hh:02d}:{mm:02d}"
 
-        # intenta seleccionar por value o por label
         try:
-            # ¿hay option cuyo value == target?
             tiene_value = any((o["value"] == target) for o in opciones)
             if tiene_value:
                 sel.select_option(value=target)
             else:
                 sel.select_option(label=target)
-
-            # verifica que quedó marcado
             page.wait_for_function(
                 """(exp, s) => {
                     const el = s;
@@ -465,7 +453,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
             return False
 
     def _retroceder_media_hora(page, sel):
-        """Si hay error, retrocede a la opción anterior disponible (una media hora menos)."""
         try:
             opciones = page.evaluate(
                 """(s) => Array.from(s.options).map(o => (o.value||o.textContent||'').trim())""",
@@ -733,4 +720,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
