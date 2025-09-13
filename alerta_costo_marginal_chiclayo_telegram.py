@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Alerta COES → Telegram (CHICLAYO 220) con Playwright
-v3: Modo ONE-SHOT para GitHub Actions + Persistencia opcional en Gist
+v3: ONE-SHOT + Gist opcional
+
+Cambios clave:
+- La FECHA se escribe como dd/mm/yyyy (America/Lima) y se disparan eventos input/change.
+- La HORA se selecciona así:
+    * Se hace CLICK en el <select> Hora para desplegarlo.
+    * Se leen todas las opciones HH:MM.
+    * Se elige la MÁS CERCANA al reloj actual (America/Lima).
+    * Si Buscar falla (error/hora vacía), se intenta con la anterior (−1) y la previa (−2).
 """
 
 import os, time, json, re, io
@@ -9,14 +17,14 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
+from playwright.sync_api import sync_playwright
 
+# -------------------- ENV --------------------
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
-
-from playwright.sync_api import sync_playwright
 
 BARRA_BUSCADA = os.getenv("BARRA_BUSCADA", "CHICLAYO 220")
 UMBRAL_S_POR_MWH = float(os.getenv("UMBRAL_S_POR_MWH", "400"))
@@ -40,6 +48,7 @@ URL_COSTOS_TIEMPO_REAL = os.getenv(
     "https://www.coes.org.pe/Portal/mercadomayorista/costosmarginales/index"
 )
 
+# -------------------- util miscelánea --------------------
 def _parse_hhmm(s: str):
     try:
         hh, mm = s.split(":")
@@ -60,7 +69,7 @@ def en_horario_sonido(ahora: datetime) -> bool:
     else:
         return not (t >= t_desde or t < t_hasta)
 
-# ----------------- Gist / estado / telegram -----------------
+# -------------------- Gist / estado / telegram --------------------
 def _gist_headers():
     return {"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"} if GIST_TOKEN else {}
 
@@ -130,7 +139,7 @@ def enviar_telegram(mensaje: str):
     r.raise_for_status()
     return r.json()
 
-# ----------------- parsing Excel/HTML -----------------
+# -------------------- parsing Excel/HTML --------------------
 def _find_header_row(raw: pd.DataFrame) -> int:
     sraw = raw.astype(str)
     has_hora  = sraw.apply(lambda r: r.str.contains(r"\bhora\b", case=False, na=False).any(), axis=1)
@@ -242,7 +251,7 @@ def leer_tabla_html(html: str) -> pd.DataFrame:
 
     raise RuntimeError("No se encontró una tabla HTML con columnas esperadas (Barra/Nodo y CM).")
 
-# ----------------- helpers de filtro/normalización -----------------
+# -------------------- helpers de filtro/normalización --------------------
 def _norm_barra(s: str) -> str:
     if s is None:
         return ""
@@ -277,10 +286,10 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
     Flujo:
       - Cierra modal.
       - FECHA = hoy (dd/mm/yyyy).
-      - HORA = mejor opción manual (máxima ≤ floor(now, 30min); si no, máxima disponible).
+      - HORA = se hace click en el combo y se elige la opción HH:MM más cercana al reloj (Lima).
+        En caso de error/hora vacía, se reintenta con la opción anterior (−1) y anterior (−2).
       - Buscar → Datos.
-      - Si falla por hora vacía o error, retrocede 30min y reintenta (hasta 3 veces).
-      - Lee tabla (DataTables o simple) y devuelve último registro por Hora.
+      - DataTables (filtro) o paginación.
     """
     from io import StringIO
 
@@ -311,11 +320,11 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
     # ---------- fecha/hora ----------
     def _cerrar_aviso(page):
         _click_possibles(page, [r"^Aceptar$", "Aceptar", r"×", r"X"])
-        page.wait_for_timeout(200)
+        page.wait_for_timeout(150)
 
     def _set_fecha_hoy(page):
         hoy = datetime.now(TZ).strftime("%d/%m/%Y")
-        # input por label
+        # por label
         fecha = None
         try:
             loc = page.locator("xpath=//label[contains(normalize-space(.),'Fecha')]/following::input[1]")
@@ -332,26 +341,21 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
             fecha.click()
             fecha.fill("")
             fecha.type(hoy, delay=18)
-            # dispara eventos para que repueble horas
+            # eventos para repoblar horas
             page.evaluate("(el)=>el.dispatchEvent(new Event('input',{bubbles:true}))", fecha)
             page.evaluate("(el)=>el.dispatchEvent(new Event('change',{bubbles:true}))", fecha)
             fecha.press("Enter")
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(250)
             return True
         except Exception:
             return False
-
-    def _calc_slot(dt: datetime) -> str:
-        mm = 0 if dt.minute < 30 else 30
-        return f"{dt.hour:02d}:{mm:02d}"
 
     def _get_hora_select(page):
         # select por label "Hora"
         try:
             loc = page.locator("xpath=//label[contains(normalize-space(.),'Hora')]/following::select[1]")
             if loc.count() > 0: return loc.first
-        except Exception:
-            pass
+        except Exception: pass
         # heurística: primer select con opciones HH:MM
         try:
             selects = page.locator("select")
@@ -368,9 +372,12 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         return None
 
     def _leer_opciones_hora(sel):
+        """Devuelve lista ordenada [(minutos, etiqueta_hhmm, value)] tras HACER CLICK en el select."""
+        opciones = []
         try:
+            sel.click()  # abrir desplegable como pides
+            time.sleep(0.15)
             opts = sel.locator("option")
-            res = []
             cnt = opts.count()
             for i in range(cnt):
                 try:
@@ -379,20 +386,36 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
                     hhmm = txt if re.fullmatch(r"\d{1,2}:\d{2}", txt) else (val if re.fullmatch(r"\d{1,2}:\d{2}", val) else None)
                     if hhmm:
                         h, m = map(int, hhmm.split(":"))
-                        res.append(((h*60+m), hhmm, val or txt))
+                        opciones.append((h*60 + m, hhmm, val or txt))
                 except Exception:
                     continue
-            return sorted(res)  # por minuto asc
+            opciones.sort()
         except Exception:
-            return []
+            pass
+        return opciones
 
-    def _select_hora_mejor(page, objetivo_hhmm: str) -> bool:
-        # espera a que el select exista y tenga opciones
+    def _select_by_value_or_label(sel, etiqueta, value):
+        try:
+            if value:
+                sel.select_option(value=value)
+            else:
+                sel.select_option(label=etiqueta)
+            return True
+        except Exception:
+            return False
+
+    def _select_hora_mas_cercana(page):
+        """
+        Abre el combo Hora, lee opciones y selecciona la HH:MM más cercana al reloj.
+        Si hay empate (p.ej. 17:15 → 17:00 vs 17:30), PREFIERE la anterior (<= ahora).
+        Devuelve (ok, lista_opciones, idx_seleccionado)
+        """
+        # espera a que exista un select con HH:MM
         try:
             page.wait_for_function(
                 """() => {
-                    const n = Array.from(document.querySelectorAll('select'));
-                    return n.some(s => Array.from(s.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent).trim())));
+                    const sels = Array.from(document.querySelectorAll('select'));
+                    return sels.some(s => Array.from(s.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent).trim())));
                 }""",
                 timeout=8000
             )
@@ -400,38 +423,45 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
             pass
 
         sel = _get_hora_select(page)
-        if not sel: return False
+        if not sel: return (False, [], -1)
 
         opciones = _leer_opciones_hora(sel)
-        if not opciones: return False
+        if not opciones: return (False, [], -1)
 
-        # objetivo → minutos
-        oh, om = map(int, objetivo_hhmm.split(":"))
-        objetivo_min = oh*60 + om
+        now = datetime.now(TZ); now_min = now.hour*60 + now.minute
+        # distancia absoluta
+        dists = [abs(mins - now_min) for mins, _, _ in opciones]
+        min_abs = min(dists)
+        # candidatos con misma distancia
+        cand_idxs = [i for i, d in enumerate(dists) if d == min_abs]
+        # preferir el que sea <= ahora
+        idx = None
+        for i in cand_idxs:
+            if opciones[i][0] <= now_min:
+                idx = i; break
+        if idx is None:
+            idx = cand_idxs[0]
 
-        candidatos = [o for o in opciones if o[0] <= objetivo_min]
-        elegido = candidatos[-1] if candidatos else opciones[-1]  # última ≤ objetivo, si no la última disponible
-        _, etiqueta, value = elegido
+        etiqueta = opciones[idx][1]; value = opciones[idx][2]
+        ok = _select_by_value_or_label(sel, etiqueta, value)
 
-        try:
-            if value:
-                sel.select_option(value=value)
-            else:
-                sel.select_option(label=etiqueta)
-            # confirmar que quedó seleccionado
-            page.wait_for_function(
-                """(exp) => {
-                    const s = Array.from(document.querySelectorAll('select')).find(x => 
-                        Array.from(x.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent).trim())));
-                    if (!s) return false;
-                    const txt = (s.value || s.options[s.selectedIndex]?.textContent || '').trim();
-                    return txt === exp;
-                }""",
-                etiqueta, timeout=3000
-            )
-            return True
-        except Exception:
-            return False
+        # confirmar
+        if ok:
+            try:
+                page.wait_for_function(
+                    """(exp) => {
+                        const s = Array.from(document.querySelectorAll('select')).find(x =>
+                            Array.from(x.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent).trim())));
+                        if (!s) return false;
+                        const txt = (s.value || s.options[s.selectedIndex]?.textContent || '').trim();
+                        return txt === exp;
+                    }""",
+                    etiqueta, timeout=3000
+                )
+            except Exception:
+                ok = False
+
+        return (ok, opciones, idx if ok else -1)
 
     def _abrir_datos(page):
         if _click_possibles(page, [r"^Datos$", "Datos"], timeout=5000): return True
@@ -484,96 +514,96 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         _cerrar_aviso(page)
         _screenshot(page, "step2_modal_closed.png")
 
-        # FECHA de hoy
+        # FECHA hoy
         _set_fecha_hoy(page)
 
-        # hora objetivo (manual) y fallback -30/-60
-        base = datetime.now(TZ)
-        objetivos = [_calc_slot(base), _calc_slot(base - timedelta(minutes=30)), _calc_slot(base - timedelta(minutes=60))]
+        # HORA más cercana (click+leer opciones)
+        ok_sel, opciones, idx_sel = _select_hora_mas_cercana(page)
 
-        html_tabla = None
-        for intento, hhmm_obj in enumerate(objetivos, 1):
-            # seleccionar mejor hora según opciones disponibles
-            ok_h = _select_hora_mejor(page, hhmm_obj)
+        # Buscar (primer intento)
+        _click_possibles(page, [r"^Buscar$", "Buscar"])
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(500)
 
-            # Buscar
-            _click_possibles(page, [r"^Buscar$", "Buscar"])
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(600)
-
-            # si el sitio muestra error o la hora quedó vacía → probar siguiente fallback
-            error_flag = page.locator("text=/Se ha producido un error/i").count() > 0
+        # Si error o hora vacía, probar con anteriores (-1, -2)
+        def _hay_error_o_hora_vacia():
             try:
+                if page.locator("text=/Se ha producido un error/i").count() > 0:
+                    return True
                 sel = _get_hora_select(page)
-                hora_val = (sel.input_value() or "").strip() if sel else ""
+                val = (sel.input_value() or "").strip() if sel else ""
+                return not val
             except Exception:
-                hora_val = ""
-            if error_flag or (not ok_h) or (not hora_val):
-                if intento < len(objetivos):
-                    continue  # probar siguiente objetivo (más temprano)
-                else:
-                    _screenshot(page, "step3_buscar_fallo.png")
-                    browser.close()
-                    raise RuntimeError("No fue posible fijar una hora válida (combo vacío o errores sucesivos).")
+                return True
 
-            _screenshot(page, "step3_clicked_buscar.png")
+        if _hay_error_o_hora_vacia() and opciones:
+            sel = _get_hora_select(page)
+            # probamos la opción anterior y la anterior a esa
+            for idx_try in [idx_sel-1, idx_sel-2]:
+                if idx_try < 0: break
+                etiqueta, value = opciones[idx_try][1], opciones[idx_try][2]
+                if sel and _select_by_value_or_label(sel, etiqueta, value):
+                    _click_possibles(page, [r"^Buscar$", "Buscar"])
+                    page.wait_for_load_state("networkidle")
+                    page.wait_for_timeout(500)
+                    if not _hay_error_o_hora_vacia():
+                        break
 
-            # pestaña Datos
-            if not _abrir_datos(page):
-                _screenshot(page, "step4_no_datos_tab.png")
-                browser.close()
-                raise RuntimeError("No se pudo abrir la pestaña 'Datos'.")
-            page.wait_for_timeout(600)
-            _screenshot(page, "step4_tab_datos.png")
+        _screenshot(page, "step3_clicked_buscar.png")
 
-            # Buscador / paginación
-            buscador = _buscar_input_datatables(page)
-            if buscador is not None:
-                try:
-                    buscador.fill("")
-                    buscador.type(BARRA_BUSCADA, delay=18)
-                    page.wait_for_function(
-                        """(texto)=>{const u=(texto||'').toUpperCase();
-                           const wrap=document.querySelector('#resultado')||document;
-                           const t=wrap.querySelector('table'); if(!t) return false;
-                           const rows=t.querySelectorAll('tbody tr');
-                           return Array.from(rows).some(r=>r.innerText.toUpperCase().includes(u));}""",
-                        BARRA_BUSCADA, timeout=9000
-                    )
-                    html_tabla = _tabla_html(page)
-                except Exception:
-                    pass
+        # pestaña Datos
+        if not _abrir_datos(page):
+            _screenshot(page, "step4_no_datos_tab.png")
+            browser.close()
+            raise RuntimeError("No se pudo abrir la pestaña 'Datos'.")
+        page.wait_for_timeout(600)
+        _screenshot(page, "step4_tab_datos.png")
 
-            if not html_tabla:
-                html = _tabla_html(page)
-                if _tabla_contiene_barra(html, BARRA_BUSCADA):
-                    html_tabla = html
-                else:
-                    # paginación
-                    def _sel_siguiente():
-                        for s in [
-                            ".dataTables_paginate .paginate_button.next:not(.disabled)",
-                            "a.paginate_button.next:not(.disabled)",
-                            "a:has-text('Siguiente'):not(.disabled)",
-                            "a:has-text('›')", "a:has-text('»')",
-                        ]:
-                            try:
-                                if page.locator(s).count() > 0 and page.locator(s).first.is_visible(): return s
-                            except Exception: pass
-                        return None
-                    for _ in range(60):
-                        nxt = _sel_siguiente()
-                        if not nxt: break
+        # Buscador / paginación
+        buscador, html_tabla = _buscar_input_datatables(page), None
+        if buscador is not None:
+            try:
+                buscador.fill("")
+                buscador.type(BARRA_BUSCADA, delay=18)
+                page.wait_for_function(
+                    """(texto)=>{const u=(texto||'').toUpperCase();
+                       const wrap=document.querySelector('#resultado')||document;
+                       const t=wrap.querySelector('table'); if(!t) return false;
+                       const rows=t.querySelectorAll('tbody tr');
+                       return Array.from(rows).some(r=>r.innerText.toUpperCase().includes(u));}""",
+                    BARRA_BUSCADA, timeout=9000
+                )
+                html_tabla = _tabla_html(page)
+            except Exception:
+                pass
+
+        if not html_tabla:
+            html = _tabla_html(page)
+            if _tabla_contiene_barra(html, BARRA_BUSCADA):
+                html_tabla = html
+            else:
+                # paginación
+                def _sel_siguiente():
+                    for s in [
+                        ".dataTables_paginate .paginate_button.next:not(.disabled)",
+                        "a.paginate_button.next:not(.disabled)",
+                        "a:has-text('Siguiente'):not(.disabled)",
+                        "a:has-text('›')", "a:has-text('»')",
+                    ]:
                         try:
-                            page.locator(nxt).first.click(); page.wait_for_timeout(450)
-                            html = _tabla_html(page)
-                            if _tabla_contiene_barra(html, BARRA_BUSCADA):
-                                html_tabla = html; break
-                        except Exception:
-                            break
-
-            if html_tabla:
-                break  # éxito con este objetivo; salimos del bucle
+                            if page.locator(s).count() > 0 and page.locator(s).first.is_visible(): return s
+                        except Exception: pass
+                    return None
+                for _ in range(60):
+                    nxt = _sel_siguiente()
+                    if not nxt: break
+                    try:
+                        page.locator(nxt).first.click(); page.wait_for_timeout(450)
+                        html = _tabla_html(page)
+                        if _tabla_contiene_barra(html, BARRA_BUSCADA):
+                            html_tabla = html; break
+                    except Exception:
+                        break
 
         if not html_tabla:
             _screenshot(page, "step5_no_table.png")
