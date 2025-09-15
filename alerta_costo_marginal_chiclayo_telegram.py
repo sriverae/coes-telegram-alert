@@ -5,11 +5,11 @@ Flujo 2025-09:
 - Acepta aviso
 - Exportar Masivo → Fecha desde / Hasta = HOY
 - Captura el Excel en memoria (sin descargar a tu laptop)
-- Lee Energía / Congestión / Total para CHICLAYO 220
-- Elige la media hora más cercana por debajo de la hora actual
+- Lee Energía / Congestión / Total para CHICLAYO 220 (soporta columnas: NOMBRE BARRA, FECHA HORA, ENERGÍA, CONGESTIÓN, TOTAL)
+- Elige la media hora más cercana hacia atrás
 """
 
-import os, time, json, re, io
+import os, time, json, re, io, unicodedata
 import pandas as pd
 import requests
 from datetime import datetime, timedelta, time as dtime
@@ -137,19 +137,14 @@ def enviar_telegram(mensaje: str):
     r.raise_for_status()
     return r.json()
 
-# ==================== PARSEO EXCEL ====================
-def _find_header_row(raw: pd.DataFrame) -> int:
-    sraw = raw.astype(str)
-    has_hora  = sraw.apply(lambda r: r.str.contains(r"\bhora\b", case=False, na=False).any(), axis=1)
-    has_barra = sraw.apply(lambda r: r.str.contains(r"\b(barra|nodo|punto)\b", case=False, na=False).any(), axis=1)
-    idxs = sraw.index[(has_hora) & (has_barra)].tolist()
-    if not idxs:
-        # fallback: primera fila que tenga 'cm'
-        has_cm = sraw.apply(lambda r: r.str.contains(r"\bcm\b", case=False, na=False).any(), axis=1)
-        idxs = sraw.index[has_hora | has_cm].tolist()
-    if not idxs:
-        raise RuntimeError("No se encontró encabezado en el Excel exportado.")
-    return idxs[0]
+# ==================== AYUDAS DE PARSEO ====================
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+def _norm_text(s: str) -> str:
+    s = _strip_accents(str(s)).upper()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def _to_float_series(s: pd.Series) -> pd.Series:
     return (
@@ -159,9 +154,96 @@ def _to_float_series(s: pd.Series) -> pd.Series:
          .astype(float)
     )
 
+# ==================== PARSEO EXCEL (ROBUSTO) ====================
+def _reshape_from_dataframe(df0: pd.DataFrame) -> pd.DataFrame | None:
+    if df0 is None or df0.empty:
+        return None
+
+    # mapear columnas por nombres (insensible a acentos/espacios)
+    cols_norm = {c: _norm_text(c) for c in df0.columns}
+
+    def _find_col_by_keywords(keywords: list[str]) -> str | None:
+        keys = [_norm_text(k) for k in keywords]
+        for c, cn in cols_norm.items():
+            for k in keys:
+                if k in cn:
+                    return c
+        return None
+
+    col_barra = _find_col_by_keywords(["NOMBRE BARRA", "BARRA", "NODO", "PUNTO"])
+    col_fechahora = _find_col_by_keywords(["FECHA HORA", "FECHA-HORA", "FECHAHORA", "FECHA Y HORA"])
+    col_fecha = _find_col_by_keywords(["FECHA"])
+    col_hora  = _find_col_by_keywords(["HORA"])
+    col_cm_energia = _find_col_by_keywords(["CM ENERGIA", "ENERGIA", "ENERGÍA", "COSTO MARGINAL ENERGIA", "COSTO MARGINAL ENERGÍA"])
+    col_cm_cong    = _find_col_by_keywords(["CM CONGESTION", "CONGESTION", "CONGESTIÓN"])
+    col_cm_total   = _find_col_by_keywords(["CM TOTAL", "TOTAL", "COSTO MARGINAL TOTAL"])
+
+    # necesitamos: Barra y algún CM; y un timestamp (FechaHora o Fecha+Hora)
+    if not col_barra:
+        return None
+    if not (col_cm_total or col_cm_energia or col_cm_cong):
+        return None
+    if not (col_fechahora or (col_fecha and col_hora)):
+        return None
+
+    keep = [c for c in [col_barra, col_fechahora, col_fecha, col_hora, col_cm_energia, col_cm_cong, col_cm_total] if c]
+    df = df0[keep].copy()
+
+    rename_map = {col_barra: "Barra"}
+    if col_fechahora: rename_map[col_fechahora] = "FechaHora"
+    if col_fecha:     rename_map[col_fecha]     = "Fecha"
+    if col_hora:      rename_map[col_hora]      = "Hora"
+    if col_cm_energia: rename_map[col_cm_energia] = "CM_Energia"
+    if col_cm_cong:    rename_map[col_cm_cong]    = "CM_Congestion"
+    if col_cm_total:   rename_map[col_cm_total]   = "CM_Total"
+    df = df.rename(columns=rename_map)
+
+    # numéricos
+    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
+        if c in df.columns:
+            df[c] = _to_float_series(df[c])
+
+    # timestamp
+    if "FechaHora" in df.columns:
+        df["ts"] = pd.to_datetime(df["FechaHora"], dayfirst=True, errors="coerce")
+    else:
+        df["ts"] = pd.to_datetime(
+            df["Fecha"].astype(str).str.strip() + " " + df["Hora"].astype(str).str.strip(),
+            dayfirst=True, errors="coerce"
+        )
+
+    return df.dropna(subset=["ts"])
+
 def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
+    """
+    1) Intentamos directo con header=0.
+    2) Si no, detectamos fila de encabezado.
+    Soporta columnas: NOMBRE BARRA, FECHA HORA, ENERGÍA, CONGESTIÓN, TOTAL.
+    """
+    # intento 1: header=0
+    try:
+        df0 = pd.read_excel(io.BytesIO(binary), header=0, engine="openpyxl")
+        df = _reshape_from_dataframe(df0)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+
+    # intento 2: localizar encabezado internamente
     raw = pd.read_excel(io.BytesIO(binary), header=None, engine="openpyxl")
-    hdr = _find_header_row(raw)
+    # buscar primera fila que contenga 'hora' y 'barra|nodo|punto'
+    sraw = raw.astype(str)
+    has_hora  = sraw.apply(lambda r: r.str.contains(r"\bhora\b", case=False, na=False).any(), axis=1)
+    has_barra = sraw.apply(lambda r: r.str.contains(r"\b(?:barra|nodo|punto)\b", case=False, na=False).any(), axis=1)
+    idxs = sraw.index[(has_hora & has_barra)].tolist()
+    if not idxs:
+        # también podría venir 'FECHA HORA' en una sola columna
+        has_fh = sraw.apply(lambda r: r.str.contains(r"fecha\s*hora", case=False, na=False).any(), axis=1)
+        idxs = sraw.index[(has_fh)].tolist()
+    if not idxs:
+        raise RuntimeError("No se encontró encabezado en el Excel exportado.")
+
+    hdr = idxs[0]
     header_row = raw.loc[hdr, :].tolist()
     first_non_null = next((i for i, v in enumerate(header_row) if pd.notna(v)), 0)
     cols = [str(c).strip() for c in raw.loc[hdr, first_non_null:].tolist()]
@@ -169,54 +251,17 @@ def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
     data.columns = cols
     data = data.dropna(how="all")
 
-    def find_col(pattern):
-        return next((c for c in data.columns if re.search(pattern, str(c), re.I)), None)
-
-    col_fecha = find_col(r"\bfecha\b")
-    col_hora  = find_col(r"\bhora\b")
-    col_barra = find_col(r"\b(barra|nodo|punto)\b")
-    col_cm_energia = find_col(r"cm\s*energ")
-    col_cm_cong    = find_col(r"cm\s*conges")
-    col_cm_total   = find_col(r"cm\s*total|costo\s*marginal\s*total")
-
-    if not (col_hora and col_barra and (col_cm_total or col_cm_energia or col_cm_cong)):
-        raise RuntimeError("Faltan columnas clave (Hora/Barra/CM).")
-
-    keep = [c for c in [col_fecha, col_hora, col_barra, col_cm_energia, col_cm_cong, col_cm_total] if c]
-    df = data[keep].copy()
-    rename_map = {col_barra: "Barra"}
-    if col_fecha:      rename_map[col_fecha] = "Fecha"
-    if col_hora:       rename_map[col_hora]  = "Hora"
-    if col_cm_energia: rename_map[col_cm_energia] = "CM_Energia"
-    if col_cm_cong:    rename_map[col_cm_cong]    = "CM_Congestion"
-    if col_cm_total:   rename_map[col_cm_total]   = "CM_Total"
-    df = df.rename(columns=rename_map)
-
-    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
-        if c in df.columns:
-            df[c] = _to_float_series(df[c])
-
-    # timestamp
-    if "Fecha" in df.columns and "Hora" in df.columns:
-        df["ts"] = pd.to_datetime(
-            df["Fecha"].astype(str).str.strip() + " " + df["Hora"].astype(str).str.strip(),
-            dayfirst=True, errors="coerce"
-        )
-    elif "Hora" in df.columns:
-        # algunos xlsx traen fecha incluida en 'Hora'
-        df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
-    else:
-        df["ts"] = pd.NaT
-
-    return df.dropna(subset=["ts"])
+    df = _reshape_from_dataframe(data)
+    if df is None or df.empty:
+        raise RuntimeError("Faltan columnas esperadas (NOMBRE BARRA / FECHA HORA / ENERGÍA / CONGESTIÓN / TOTAL).")
+    return df
 
 # ==================== NORMALIZACIÓN BARRA ====================
 def _norm_barra(s: str) -> str:
     if s is None:
         return ""
-    t = str(s).upper()
-    t = re.sub(r"\s+", "", t)
-    t = t.replace(".", "")
+    t = _norm_text(str(s))
+    t = t.replace(".", "").replace(" ", "")
     return t
 
 def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame:
@@ -226,7 +271,7 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
 
     ciudad = _norm_barra("CHICLAYO")
     candidatos = df[
-        df["Barra_norm"].str.contains(objetivo, na=False)
+        df["Barra_norm"].str.contains(_norm_text(barra_objetivo).replace(" ", ""), na=False)
         | df["Barra_norm"].str.contains(ciudad, na=False)
         | df["Barra_norm"].str.contains("CHICLAYO220", na=False)
         | df["Barra_norm"].str.contains("CHICLAYO220K?V?", na=False, regex=True)
@@ -283,7 +328,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
     def _find_modal_inputs(page):
         """
         Busca los dos inputs del modal 'Exportar Datos' (Fecha desde / Hasta)
-        con varios selectores robustos (labels, texto, placeholders).
+        tolerando variaciones (con/sin dos puntos).
         """
         candidatos = []
         # por label/etiqueta cercana
@@ -300,28 +345,22 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
         except Exception:
             pass
 
-        # si no encontró 2, buscar dentro del contenedor que tiene 'Exportar Datos' y 'Aceptar'
+        # si no encontró 2, buscar inputs visibles dentro del contenedor del modal
         if len(candidatos) < 2:
             try:
                 modal = page.locator("xpath=//*[contains(.,'Exportar Datos')]/ancestor::div[1]")
                 if modal.count() == 0:
-                    # fallback: último contenedor con botón Aceptar visible
                     aceptar = page.get_by_role("button", name=re.compile(r"Aceptar", re.I)).last
                     modal = aceptar.locator("xpath=ancestor::div[1]")
                 inputs = modal.locator("input")
-                # visibles y no checkbox
                 vis = [inputs.nth(i) for i in range(inputs.count()) if inputs.nth(i).is_visible()]
-                # priorizar type='date' o con máscara de fecha
-                vis_order = []
-                for el in vis:
-                    try:
-                        typ = (el.get_attribute("type") or "").lower()
-                    except Exception:
-                        typ = ""
-                    score = 2 if typ == "date" else 1
-                    vis_order.append((score, el))
-                vis_order.sort(reverse=True, key=lambda x: x[0])
-                candidatos = [e for _, e in vis_order[:2]]
+                # priorizar type='date'
+                ordered = sorted(
+                    vis,
+                    key=lambda el: 2 if ((el.get_attribute("type") or "").lower() == "date") else 1,
+                    reverse=True
+                )
+                candidatos = ordered[:2]
             except Exception:
                 pass
 
@@ -345,11 +384,10 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
             browser.close()
             raise RuntimeError("No se pudo abrir 'Exportar Masivo'.")
 
-        # esperar que aparezca el modal
         page.wait_for_selector("text=/Exportar Datos/i", timeout=10_000)
         _screenshot(page, "step3_open_export_modal.png")
 
-        # localizar inputs y escribir HOY (dd/mm/yyyy)
+        # HOY (dd/mm/yyyy)
         hoy = datetime.now(TZ).strftime("%d/%m/%Y")
         inp_desde, inp_hasta = _find_modal_inputs(page)
         for inp in (inp_desde, inp_hasta):
@@ -361,19 +399,16 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
                 pass
         _screenshot(page, "step4_dates_filled.png")
 
-        # capturar download al hacer Aceptar
+        # Descargar/capturar
         with page.expect_download(timeout=60_000) as dl_info:
             _click_possibles(page, [r"^Aceptar$", "Aceptar"])
         download = dl_info.value
 
-        # guardar a disco (workspace) y cargar en memoria
         export_path = "export_debug.xlsx"
         try:
             download.save_as(export_path)
         except Exception:
-            # algunos entornos no permiten path() hasta completar
             pass
-        # si no se guardó explícito, obtener path generado por Playwright
         path = None
         try:
             path = download.path()
@@ -381,16 +416,12 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
             pass
         if path and not os.path.exists(export_path):
             try:
-                # copiar
                 with open(path, "rb") as src, open(export_path, "wb") as dst:
                     dst.write(src.read())
             except Exception:
                 pass
-
-        # por si acaso, screenshot luego de aceptar
         _screenshot(page, "step5_after_accept.png")
 
-        # leer binario
         binary = None
         for candidate in [export_path, path]:
             if candidate and os.path.exists(candidate):
@@ -412,33 +443,32 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
     target_min = (ahora.hour * 60 + ahora.minute) // 30 * 30
     target_ts = ahora.replace(hour=target_min // 60, minute=target_min % 60, second=0, microsecond=0)
 
-    # asegurar timezone en df['ts']
+    # timezone
     if df["ts"].dt.tz is None:
         df["ts"] = df["ts"].dt.tz_localize(TZ)
     else:
         df["ts"] = df["ts"].dt.tz_convert(TZ)
 
-    # filtrar por fecha de hoy
+    # filtrar por hoy
     hoy_ini = ahora.replace(hour=0, minute=0, second=0, microsecond=0)
     hoy_fin = hoy_ini + timedelta(days=1)
     dfd = df[(df["ts"] >= hoy_ini) & (df["ts"] < hoy_fin)].copy()
+    if dfd.empty:
+        raise RuntimeError("No se hallaron registros para hoy en el Excel exportado.")
 
     elegido = None
-    # ir retrocediendo de 30 en 30 hasta hallar un match
     for k in range(0, 48):
         cand = target_ts - timedelta(minutes=30 * k)
-        hit = dfd[ dfd["ts"] == cand ]
+        hit = dfd[dfd["ts"] == cand]
         if not hit.empty:
             elegido = hit.sort_values("ts").iloc[-1]
             break
-    # si no hubo exacto, elegir el menor más cercano
-    if elegido is None and not dfd.empty:
+    if elegido is None:
         menor = dfd[dfd["ts"] <= target_ts]
         if not menor.empty:
             elegido = menor.sort_values("ts").iloc[-1]
-    # si sigue vacío, último de la jornada
     if elegido is None:
-        raise RuntimeError("No se hallaron registros para hoy en el Excel exportado.")
+        elegido = dfd.sort_values("ts").iloc[-1]
 
     energia = float(elegido["CM_Energia"]) if "CM_Energia" in dfd.columns else None
     congestion = float(elegido["CM_Congestion"]) if "CM_Congestion" in dfd.columns else None
@@ -504,4 +534,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
