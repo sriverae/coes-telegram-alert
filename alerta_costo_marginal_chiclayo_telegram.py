@@ -229,7 +229,8 @@ def _parse_excel_like(binary_or_path) -> pd.DataFrame:
     if col_tot: out["CM_Total"]      = _clean_numeric_series(data[col_tot])
 
     out["ts"] = pd.to_datetime(data[col_fh].astype(str), dayfirst=True, errors="coerce")
-    out["ts"] = out["ts"].dt.tz_localize(TZ, nonexistent="shift_forward", ambiguous="NaT", errors="coerce")
+    # FIX de timezone: sin 'errors=' y con 'ambiguous="infer"'
+    out["ts"] = out["ts"].dt.tz_localize(TZ, ambiguous="infer", nonexistent="shift_forward")
 
     return out
 
@@ -309,7 +310,7 @@ def obtener_ultimo_costo_via_web(timeout_ms=120000):
             page.get_by_text(re.compile(r"Exportar\s*Masivo", re.I)).first.click(timeout=6000)
         _screenshot(page, "step3_open_export_modal.png")
 
-        # Tratar de encontrar el modal (pero si no, igual probamos el click Aceptar global)
+        # Tratar de encontrar el modal (si no, igual probamos Aceptar general)
         modal = None
         for sel in [
             "xpath=//*[contains(.,'Exportar Datos')]/ancestor::div[contains(@class,'modal')][1]",
@@ -335,7 +336,6 @@ def obtener_ultimo_costo_via_web(timeout_ms=120000):
                         fields.append(candidate.first)
                 except Exception:
                     pass
-            # completar dos primeros si los hay
             for el in fields[:2]:
                 try:
                     el.click(); el.fill(""); el.type(today_str, delay=15)
@@ -384,7 +384,6 @@ def obtener_ultimo_costo_por_export():
     if EXCEL_FILE and os.path.exists(EXCEL_FILE):
         print(f"[INFO] Usando Excel local: {EXCEL_FILE}")
         return leer_excel_local_o_bytes(EXCEL_FILE)
-    # Si no hay Excel local, ir por web
     print("[INFO] No hay Excel local; intentando flujo web (Exportar Masivo).")
     return obtener_ultimo_costo_via_web()
 
@@ -438,4 +437,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
