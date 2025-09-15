@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Alerta COES → Telegram (CHICLAYO 220) usando Exportar Masivo
-- One-shot amigable para GitHub Actions
-- Captura el Excel en memoria (Playwright expect_download)
-- Lee columnas Energía, Congestión y Total de forma robusta
-- Selecciona la hora más cercana por debajo a la hora actual (pasos de 30 min)
-- Guarda step*.png y export_debug.xlsx para debug
+Alerta COES → Telegram (CHICLAYO 220)
+Flujo 2025-09:
+- Acepta aviso
+- Exportar Masivo → Fecha desde / Hasta = HOY
+- Captura el Excel en memoria (sin descargar a tu laptop)
+- Lee Energía / Congestión / Total para CHICLAYO 220
+- Elige la media hora más cercana por debajo de la hora actual
 """
 
 import os, time, json, re, io
 import pandas as pd
 import requests
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 try:
@@ -22,13 +23,13 @@ except Exception:
 
 from playwright.sync_api import sync_playwright
 
-# =============== Config ===============
+# ==================== CONFIG ====================
 BARRA_BUSCADA = os.getenv("BARRA_BUSCADA", "CHICLAYO 220")
 UMBRAL_S_POR_MWH = float(os.getenv("UMBRAL_S_POR_MWH", "400"))
 INTERVALO_MINUTOS = int(os.getenv("INTERVALO_MINUTOS", "30"))
 TZ = ZoneInfo(os.getenv("TZ", "America/Lima"))
-SILENCIO_DESDE = os.getenv("SILENCIO_DESDE")  # "22:00"
-SILENCIO_HASTA = os.getenv("SILENCIO_HASTA")  # "06:30"
+SILENCIO_DESDE = os.getenv("SILENCIO_DESDE")
+SILENCIO_HASTA = os.getenv("SILENCIO_HASTA")
 ONESHOT = os.getenv("ONESHOT", "0") == "1"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -45,7 +46,7 @@ URL_COSTOS_TIEMPO_REAL = os.getenv(
     "https://www.coes.org.pe/Portal/mercadomayorista/costosmarginales/index"
 )
 
-# =============== Utiles horario ===============
+# ==================== UTILIDADES ====================
 def _parse_hhmm(s: str):
     try:
         hh, mm = s.split(":")
@@ -66,7 +67,7 @@ def en_horario_sonido(ahora: datetime) -> bool:
     else:
         return not (t >= t_desde or t < t_hasta)
 
-# =============== Gist state (opcional) ===============
+# --------- Gist (persistencia opcional) ---------
 def _gist_headers():
     return {"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json"} if GIST_TOKEN else {}
 
@@ -127,7 +128,6 @@ def guardar_estado(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-# =============== Telegram ===============
 def enviar_telegram(mensaje: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
@@ -137,7 +137,80 @@ def enviar_telegram(mensaje: str):
     r.raise_for_status()
     return r.json()
 
-# =============== Normalización barra ===============
+# ==================== PARSEO EXCEL ====================
+def _find_header_row(raw: pd.DataFrame) -> int:
+    sraw = raw.astype(str)
+    has_hora  = sraw.apply(lambda r: r.str.contains(r"\bhora\b", case=False, na=False).any(), axis=1)
+    has_barra = sraw.apply(lambda r: r.str.contains(r"\b(barra|nodo|punto)\b", case=False, na=False).any(), axis=1)
+    idxs = sraw.index[(has_hora) & (has_barra)].tolist()
+    if not idxs:
+        # fallback: primera fila que tenga 'cm'
+        has_cm = sraw.apply(lambda r: r.str.contains(r"\bcm\b", case=False, na=False).any(), axis=1)
+        idxs = sraw.index[has_hora | has_cm].tolist()
+    if not idxs:
+        raise RuntimeError("No se encontró encabezado en el Excel exportado.")
+    return idxs[0]
+
+def _to_float_series(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+         .str.replace(",", ".", regex=False)
+         .str.extract(r"([-]?[0-9]+(?:\.[0-9]+)?)")[0]
+         .astype(float)
+    )
+
+def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
+    raw = pd.read_excel(io.BytesIO(binary), header=None, engine="openpyxl")
+    hdr = _find_header_row(raw)
+    header_row = raw.loc[hdr, :].tolist()
+    first_non_null = next((i for i, v in enumerate(header_row) if pd.notna(v)), 0)
+    cols = [str(c).strip() for c in raw.loc[hdr, first_non_null:].tolist()]
+    data = raw.loc[hdr+1:, first_non_null:].copy()
+    data.columns = cols
+    data = data.dropna(how="all")
+
+    def find_col(pattern):
+        return next((c for c in data.columns if re.search(pattern, str(c), re.I)), None)
+
+    col_fecha = find_col(r"\bfecha\b")
+    col_hora  = find_col(r"\bhora\b")
+    col_barra = find_col(r"\b(barra|nodo|punto)\b")
+    col_cm_energia = find_col(r"cm\s*energ")
+    col_cm_cong    = find_col(r"cm\s*conges")
+    col_cm_total   = find_col(r"cm\s*total|costo\s*marginal\s*total")
+
+    if not (col_hora and col_barra and (col_cm_total or col_cm_energia or col_cm_cong)):
+        raise RuntimeError("Faltan columnas clave (Hora/Barra/CM).")
+
+    keep = [c for c in [col_fecha, col_hora, col_barra, col_cm_energia, col_cm_cong, col_cm_total] if c]
+    df = data[keep].copy()
+    rename_map = {col_barra: "Barra"}
+    if col_fecha:      rename_map[col_fecha] = "Fecha"
+    if col_hora:       rename_map[col_hora]  = "Hora"
+    if col_cm_energia: rename_map[col_cm_energia] = "CM_Energia"
+    if col_cm_cong:    rename_map[col_cm_cong]    = "CM_Congestion"
+    if col_cm_total:   rename_map[col_cm_total]   = "CM_Total"
+    df = df.rename(columns=rename_map)
+
+    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
+        if c in df.columns:
+            df[c] = _to_float_series(df[c])
+
+    # timestamp
+    if "Fecha" in df.columns and "Hora" in df.columns:
+        df["ts"] = pd.to_datetime(
+            df["Fecha"].astype(str).str.strip() + " " + df["Hora"].astype(str).str.strip(),
+            dayfirst=True, errors="coerce"
+        )
+    elif "Hora" in df.columns:
+        # algunos xlsx traen fecha incluida en 'Hora'
+        df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
+    else:
+        df["ts"] = pd.NaT
+
+    return df.dropna(subset=["ts"])
+
+# ==================== NORMALIZACIÓN BARRA ====================
 def _norm_barra(s: str) -> str:
     if s is None:
         return ""
@@ -166,116 +239,97 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
     con220 = candidatos[candidatos["Barra_norm"].str.contains("220", na=False)]
     return con220 if not con220.empty else candidatos
 
-# =============== Lectura Excel Exportado ===============
-def _find_header_row(raw: pd.DataFrame) -> int:
-    sraw = raw.astype(str)
-    has_hora  = sraw.apply(lambda r: r.str.contains(r"\bhora\b", case=False, na=False).any(), axis=1)
-    has_barra = sraw.apply(lambda r: r.str.contains(r"\b(barra|nodo|punto)\b", case=False, na=False).any(), axis=1)
-    idxs = sraw.index[(has_hora) & (has_barra)].tolist()
-    if not idxs:
-        raise RuntimeError("No se encontró encabezado con 'Hora' y 'Barra/Nodo' en el Excel exportado.")
-    return idxs[0]
-
-def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
-    """Lee el Excel exportado por 'Exportar Masivo' (formato 'CostosMarginalesNodales') de forma robusta."""
-    raw = pd.read_excel(io.BytesIO(binary), header=None, engine="openpyxl")
-    hdr = _find_header_row(raw)
-    header_row = raw.loc[hdr, :].tolist()
-    first_non_null = next((i for i, v in enumerate(header_row) if pd.notna(v)), 0)
-    cols = [str(c).strip() for c in raw.loc[hdr, first_non_null:].tolist()]
-    data = raw.loc[hdr+1:, first_non_null:].copy()
-    data.columns = cols
-    data = data.dropna(how="all")
-
-    def find_col(patterns):
-        if isinstance(patterns, str):
-            patterns = [patterns]
-        for p in patterns:
-            for c in data.columns:
-                if re.search(p, str(c), re.I):
-                    return c
-        return None
-
-    col_fecha = find_col([r"\bfecha\b"])
-    col_hora  = find_col([r"\bhora\b"])
-    col_barra = find_col([r"\b(barra|nodo|punto)\b"])
-    col_cm_energia = find_col([r"\bcm\b.*energ", r"costo.*energ"])
-    col_cm_cong    = find_col([r"\bcm\b.*conges", r"costo.*conges"])
-    col_cm_total   = find_col([r"\bcm\b.*total", r"costo.*marginal.*total"])
-
-    if not (col_hora and col_barra and (col_cm_total or col_cm_energia or col_cm_cong)):
-        raise RuntimeError("Faltan columnas clave (Hora/Barra y alguna de CM Energía/Congestión/Total).")
-
-    keep = [c for c in [col_fecha, col_hora, col_barra, col_cm_energia, col_cm_cong, col_cm_total] if c]
-    df = data[keep].copy()
-
-    rename_map = {col_barra: "Barra", col_hora: "Hora"}
-    if col_fecha:      rename_map[col_fecha] = "Fecha"
-    if col_cm_energia: rename_map[col_cm_energia] = "CM_Energia"
-    if col_cm_cong:    rename_map[col_cm_cong]    = "CM_Congestion"
-    if col_cm_total:   rename_map[col_cm_total]   = "CM_Total"
-    df = df.rename(columns=rename_map)
-
-    # Normaliza valores numéricos
-    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
-        if c in df.columns:
-            df[c] = (
-                df[c].astype(str)
-                    .str.replace(",", ".", regex=False)
-                    .str.extract(r"([-]?[0-9]+(?:\.[0-9]+)?)")[0]
-                    .astype(float)
-            )
-
-    # ts = Fecha + Hora (o solo Hora si ya viene fecha embebida)
-    if "Fecha" in df.columns:
-        df["ts"] = pd.to_datetime(df["Fecha"].astype(str).str.strip() + " " + df["Hora"].astype(str).str.strip(),
-                                  dayfirst=True, errors="coerce")
-    else:
-        df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
-
-    return df
-
-# =============== Select filtro (por si aplica) ===============
-def _select_filter_barras_138(page):
-    """Intenta seleccionar el filtro 'Barras mayores a 138' (texto flexible)."""
-    selects = page.locator("select")
-    try:
-        n = selects.count()
-    except:
-        n = 0
-    for i in range(n):
-        sel = selects.nth(i)
-        try:
-            opts = sel.locator("option")
-            texts = opts.all_inner_texts()
-            for idx, t in enumerate(texts):
-                if re.search(r"barras\s+mayores?\s+a\s*138", t or "", re.I):
-                    val = opts.nth(idx).get_attribute("value")
-                    if val and val.strip():
-                        sel.select_option(val)
-                        return True
-        except Exception:
-            pass
-    return False
-
-# =============== Flujo principal (Exportar Masivo) ===============
-def obtener_ultimo_costo_por_export(timeout_ms=180000):
+# ==================== FLUJO WEB: EXPORTAR MASIVO ====================
+def obtener_ultimo_costo_por_export(timeout_ms=150_000):
     """
-    Flujo:
-      1) Abrir página y cerrar 'Aviso' → step1/step2.
-      2) (opcional) Filtro 'Barras mayores a 138 kV'.
-      3) Click 'Exportar Masivo' → aparece modal → step3.
-      4) Rellenar 'Fecha desde' y 'Hasta' con HOY (dd/mm/yyyy) → step4.
-      5) Click 'Aceptar' y capturar el Excel vía expect_download → step5 + export_debug.xlsx.
-      6) Parsear Excel en memoria, filtrar 'CHICLAYO 220', elegir hora más cercana por debajo a ahora.
-      7) Retornar energía, congestión, total, ts y barra.
+    1) Abre la página y cierra el aviso.
+    2) Click en 'Exportar Masivo'.
+    3) En el modal: poner HOY en 'Fecha desde' y 'Hasta' (dd/mm/yyyy).
+    4) Click en 'Aceptar' capturando el Excel en memoria.
+    5) Parsear y elegir la media hora más cercana hacia atrás (hoy).
     """
     def _screenshot(page, name):
-        try: page.screenshot(path=name)
-        except Exception: pass
+        try:
+            page.screenshot(path=name)
+        except Exception:
+            pass
 
-    hoy_str = datetime.now(TZ).strftime("%d/%m/%Y")
+    def _click_possibles(page, textos, timeout=7000):
+        for t in textos:
+            try:
+                page.get_by_role("button", name=re.compile(t, re.I)).click(timeout=timeout); return True
+            except Exception: pass
+            try:
+                page.get_by_text(re.compile(t, re.I)).first.click(timeout=timeout); return True
+            except Exception: pass
+            try:
+                page.locator(f"button:has-text('{t}')").first.click(timeout=timeout); return True
+            except Exception: pass
+            try:
+                page.locator(f"a:has-text('{t}')").first.click(timeout=timeout); return True
+            except Exception: pass
+            try:
+                page.locator(f"input[type='button'][value*='{t}']").first.click(timeout=timeout); return True
+            except Exception: pass
+        return False
 
+    def _cerrar_aviso(page):
+        _click_possibles(page, [r"^Aceptar$", "Aceptar", r"×", r"X"])
+        page.wait_for_timeout(250)
+
+    def _abrir_exportar_masivo(page):
+        return _click_possibles(page, [r"^Exportar Masivo$", "Exportar Masivo"])
+
+    def _find_modal_inputs(page):
+        """
+        Busca los dos inputs del modal 'Exportar Datos' (Fecha desde / Hasta)
+        con varios selectores robustos (labels, texto, placeholders).
+        """
+        candidatos = []
+        # por label/etiqueta cercana
+        try:
+            loc = page.locator("xpath=//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ','abcdefghijklmnopqrstuvwxyzáéíóú'),'fecha desde')]/following::input[1]")
+            if loc.count() > 0 and loc.first.is_visible():
+                candidatos.append(loc.first)
+        except Exception:
+            pass
+        try:
+            loc = page.locator("xpath=//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ','abcdefghijklmnopqrstuvwxyzáéíóú'),'hasta')]/following::input[1]")
+            if loc.count() > 0 and loc.first.is_visible():
+                candidatos.append(loc.first)
+        except Exception:
+            pass
+
+        # si no encontró 2, buscar dentro del contenedor que tiene 'Exportar Datos' y 'Aceptar'
+        if len(candidatos) < 2:
+            try:
+                modal = page.locator("xpath=//*[contains(.,'Exportar Datos')]/ancestor::div[1]")
+                if modal.count() == 0:
+                    # fallback: último contenedor con botón Aceptar visible
+                    aceptar = page.get_by_role("button", name=re.compile(r"Aceptar", re.I)).last
+                    modal = aceptar.locator("xpath=ancestor::div[1]")
+                inputs = modal.locator("input")
+                # visibles y no checkbox
+                vis = [inputs.nth(i) for i in range(inputs.count()) if inputs.nth(i).is_visible()]
+                # priorizar type='date' o con máscara de fecha
+                vis_order = []
+                for el in vis:
+                    try:
+                        typ = (el.get_attribute("type") or "").lower()
+                    except Exception:
+                        typ = ""
+                    score = 2 if typ == "date" else 1
+                    vis_order.append((score, el))
+                vis_order.sort(reverse=True, key=lambda x: x[0])
+                candidatos = [e for _, e in vis_order[:2]]
+            except Exception:
+                pass
+
+        if len(candidatos) < 2:
+            raise RuntimeError("No se encontraron campos 'Fecha desde/Hasta' en el modal de exportación.")
+        return candidatos[0], candidatos[1]
+
+    # --------- navegación ---------
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 900})
@@ -284,195 +338,129 @@ def obtener_ultimo_costo_por_export(timeout_ms=180000):
         page.wait_for_load_state("networkidle")
         _screenshot(page, "step1_loaded.png")
 
-        # Cerrar modal "Aviso"
-        for sel in [r"^Aceptar$", "Aceptar", "×", "X"]:
-            try:
-                page.get_by_role("button", name=re.compile(sel, re.I)).click(timeout=2000)
-                break
-            except Exception:
-                try:
-                    page.get_by_text(re.compile(sel, re.I)).first.click(timeout=2000)
-                    break
-                except Exception:
-                    pass
-        page.wait_for_timeout(300)
+        _cerrar_aviso(page)
         _screenshot(page, "step2_modal_closed.png")
 
-        # (Opcional) aplicar filtro
-        try:
-            _select_filter_barras_138(page)
-        except Exception:
-            pass
-
-        # Abrir "Exportar Masivo" (el botón de la derecha)
-        opened = False
-        for try_sel in [r"^Exportar\s*Masivo$", "Exportar Masivo", "Exportar\s*Masivo"]:
-            try:
-                page.get_by_role("button", name=re.compile(try_sel, re.I)).click(timeout=4000)
-                opened = True
-                break
-            except Exception:
-                try:
-                    page.locator(f"button:has-text('{try_sel}')").first.click(timeout=4000)
-                    opened = True
-                    break
-                except Exception:
-                    pass
-        if not opened:
+        if not _abrir_exportar_masivo(page):
             browser.close()
             raise RuntimeError("No se pudo abrir 'Exportar Masivo'.")
 
-        page.wait_for_timeout(400)
+        # esperar que aparezca el modal
+        page.wait_for_selector("text=/Exportar Datos/i", timeout=10_000)
         _screenshot(page, "step3_open_export_modal.png")
 
-        # Localizar inputs dentro del modal
-        def _loc_fecha(label_texts):
-            for t in label_texts:
-                try:
-                    loc = page.locator(f"xpath=//div[contains(@class,'modal') or contains(@class,'swal2-container')]//label[contains(.,'{t}')]/following::input[1]")
-                    if loc.count() > 0:
-                        return loc.first
-                except Exception:
-                    pass
-            # fallback: primeros dos inputs visibles dentro del modal
+        # localizar inputs y escribir HOY (dd/mm/yyyy)
+        hoy = datetime.now(TZ).strftime("%d/%m/%Y")
+        inp_desde, inp_hasta = _find_modal_inputs(page)
+        for inp in (inp_desde, inp_hasta):
             try:
-                modal_inputs = page.locator("div.modal-dialog input, div.modal-content input").filter(has_text=None)
-                if modal_inputs.count() >= 2:
-                    return modal_inputs.nth(0)
+                inp.click()
+                inp.fill("")
+                inp.type(hoy, delay=15)
             except Exception:
                 pass
-            return None
+        _screenshot(page, "step4_dates_filled.png")
 
-        fecha_desde = _loc_fecha(["Fecha desde", "Desde"])
-        fecha_hasta = None
-        # intentar ubicar el segundo campo por label directa
-        for t in ["Hasta", "Fecha hasta"]:
-            try:
-                loc = page.locator(f"xpath=//div[contains(@class,'modal') or contains(@class,'swal2-container')]//label[contains(.,'{t}')]/following::input[1]")
-                if loc.count() > 0:
-                    fecha_hasta = loc.first
-                    break
-            except Exception:
-                pass
-        # fallback: segundo input
-        if not fecha_hasta:
-            try:
-                modal_inputs = page.locator("div.modal-dialog input, div.modal-content input").filter(has_text=None)
-                if modal_inputs.count() >= 2:
-                    fecha_hasta = modal_inputs.nth(1)
-            except Exception:
-                pass
+        # capturar download al hacer Aceptar
+        with page.expect_download(timeout=60_000) as dl_info:
+            _click_possibles(page, [r"^Aceptar$", "Aceptar"])
+        download = dl_info.value
 
-        if not (fecha_desde and fecha_hasta):
-            browser.close()
-            raise RuntimeError("No se encontraron campos 'Fecha desde/Hasta' en el modal de exportación.")
-
-        # Rellenar dd/mm/yyyy y disparar eventos
-        for campo in [fecha_desde, fecha_hasta]:
-            try:
-                campo.click()
-                campo.fill("")
-                campo.type(hoy_str, delay=15)
-                page.evaluate("(el)=>{el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}", campo)
-            except Exception:
-                pass
-
-        page.wait_for_timeout(200)
-        _screenshot(page, "step4_filled_export_dates.png")
-
-        # Click Aceptar y capturar la descarga
-        excel_bytes = None
+        # guardar a disco (workspace) y cargar en memoria
+        export_path = "export_debug.xlsx"
         try:
-            with page.expect_download(timeout=30000) as dl_info:
-                # botón Aceptar dentro del modal
-                clicked = False
-                for t in [r"^Aceptar$", "Aceptar", "Exportar"]:
-                    try:
-                        page.get_by_role("button", name=re.compile(t, re.I)).click(timeout=3000)
-                        clicked = True
-                        break
-                    except Exception:
-                        try:
-                            page.locator(f"xpath=//div[contains(@class,'modal')]//button[contains(.,'{t}')]").first.click(timeout=3000)
-                            clicked = True
-                            break
-                        except Exception:
-                            pass
-                if not clicked:
-                    raise RuntimeError("No se pudo hacer clic en 'Aceptar' del modal de exportación.")
-            download = dl_info.value
-            # Guardar a disco para artifact y obtener bytes en memoria
+            download.save_as(export_path)
+        except Exception:
+            # algunos entornos no permiten path() hasta completar
+            pass
+        # si no se guardó explícito, obtener path generado por Playwright
+        path = None
+        try:
+            path = download.path()
+        except Exception:
+            pass
+        if path and not os.path.exists(export_path):
             try:
-                download.save_as("export_debug.xlsx")
+                # copiar
+                with open(path, "rb") as src, open(export_path, "wb") as dst:
+                    dst.write(src.read())
             except Exception:
                 pass
-            try:
-                excel_bytes = download.content()
-            except Exception:
-                # fallback a leer del archivo guardado
-                try:
-                    with open("export_debug.xlsx", "rb") as f:
-                        excel_bytes = f.read()
-                except Exception:
-                    excel_bytes = None
-        except Exception as e:
-            browser.close()
-            raise RuntimeError(f"Fallo al capturar la descarga del Excel: {e}")
 
-        page.wait_for_timeout(400)
-        _screenshot(page, "step5_download_done.png")
+        # por si acaso, screenshot luego de aceptar
+        _screenshot(page, "step5_after_accept.png")
+
+        # leer binario
+        binary = None
+        for candidate in [export_path, path]:
+            if candidate and os.path.exists(candidate):
+                with open(candidate, "rb") as f:
+                    binary = f.read()
+                break
+
         browser.close()
 
-    if not excel_bytes:
-        raise RuntimeError("No se pudo obtener el contenido del Excel exportado.")
+    if not binary:
+        raise RuntimeError("No se pudo capturar el archivo Excel exportado.")
 
-    # ---- Parseo Excel ----
-    df = leer_excel_exportado_en_memoria(excel_bytes)
-
-    # Filtrar por barra
+    # ---- Parseo y selección del registro adecuado ----
+    df = leer_excel_exportado_en_memoria(binary)
     df = filtrar_barra_robusto(df, BARRA_BUSCADA)
-    if df.empty:
-        raise RuntimeError(f"No se obtuvo ningún registro para '{BARRA_BUSCADA}' en el Excel.")
 
-    # Seleccionar hora más cercana por debajo (saltos de 30 min)
+    # objetivo: media hora más cercana hacia atrás (hoy)
     ahora = datetime.now(TZ)
-    df = df.dropna(subset=["ts"]).copy()
-    if df.empty:
-        raise RuntimeError("El Excel no contiene una columna de tiempo legible ('ts').")
+    target_min = (ahora.hour * 60 + ahora.minute) // 30 * 30
+    target_ts = ahora.replace(hour=target_min // 60, minute=target_min % 60, second=0, microsecond=0)
 
-    # solo filas de HOY (por si vienen varias fechas)
-    df["ts_local"] = df["ts"].dt.tz_localize(TZ, nonexistent='shift_forward', ambiguous='NaT') if df["ts"].dt.tz is None else df["ts"].dt.tz_convert(TZ)
-    df_hoy = df[df["ts_local"].dt.date == ahora.date()]
-    if df_hoy.empty:
-        df_hoy = df  # si no hay explícito de hoy, usamos todo
+    # asegurar timezone en df['ts']
+    if df["ts"].dt.tz is None:
+        df["ts"] = df["ts"].dt.tz_localize(TZ)
+    else:
+        df["ts"] = df["ts"].dt.tz_convert(TZ)
 
-    candidatos = df_hoy[df_hoy["ts_local"] <= ahora].sort_values("ts_local")
-    row = candidatos.iloc[-1] if not candidatos.empty else df_hoy.sort_values("ts_local").iloc[-1]
+    # filtrar por fecha de hoy
+    hoy_ini = ahora.replace(hour=0, minute=0, second=0, microsecond=0)
+    hoy_fin = hoy_ini + timedelta(days=1)
+    dfd = df[(df["ts"] >= hoy_ini) & (df["ts"] < hoy_fin)].copy()
 
-    energia    = float(row["CM_Energia"])   if "CM_Energia"   in row.index and pd.notna(row["CM_Energia"])   else None
-    congestion = float(row["CM_Congestion"])if "CM_Congestion"in row.index and pd.notna(row["CM_Congestion"])else None
-    total      = float(row["CM_Total"])     if "CM_Total"     in row.index and pd.notna(row["CM_Total"])     else None
-    if total is None:
-        # si no viene total, suma energía + congestión si existen
-        if (energia is not None) and (congestion is not None):
-            total = energia + congestion
-        else:
-            raise RuntimeError("No fue posible determinar 'CM_Total'.")
+    elegido = None
+    # ir retrocediendo de 30 en 30 hasta hallar un match
+    for k in range(0, 48):
+        cand = target_ts - timedelta(minutes=30 * k)
+        hit = dfd[ dfd["ts"] == cand ]
+        if not hit.empty:
+            elegido = hit.sort_values("ts").iloc[-1]
+            break
+    # si no hubo exacto, elegir el menor más cercano
+    if elegido is None and not dfd.empty:
+        menor = dfd[dfd["ts"] <= target_ts]
+        if not menor.empty:
+            elegido = menor.sort_values("ts").iloc[-1]
+    # si sigue vacío, último de la jornada
+    if elegido is None:
+        raise RuntimeError("No se hallaron registros para hoy en el Excel exportado.")
 
-    ts = row["ts_local"]
-    barra = row["Barra"]
+    energia = float(elegido["CM_Energia"]) if "CM_Energia" in dfd.columns else None
+    congestion = float(elegido["CM_Congestion"]) if "CM_Congestion" in dfd.columns else None
+    total = float(elegido["CM_Total"]) if "CM_Total" in dfd.columns else None
+    ts = elegido["ts"]
 
-    return {"barra": barra, "ts": ts, "energia": energia, "congestion": congestion, "total": total}
+    return {
+        "barra": elegido["Barra"],
+        "ts": ts,
+        "energia": energia,
+        "congestion": congestion,
+        "total": total,
+    }
 
-# =============== LOOP / Mensaje ===============
+# ==================== LOOP / MENSAJE ====================
 def ejecutar_iteracion():
     estado = cargar_estado()
     dato = obtener_ultimo_costo_por_export()
-
-    energia    = dato.get("energia")
+    energia = dato.get("energia")
     congestion = dato.get("congestion")
-    total      = dato["total"]
-    ts_local   = dato["ts"].astimezone(TZ)
+    total = dato.get("total")
+    ts_local = dato["ts"].astimezone(TZ)
 
     ahora = datetime.now(TZ)
     lineas = [
@@ -483,7 +471,8 @@ def ejecutar_iteracion():
         lineas.append(f"CM Energía: <b>S/ {energia:,.2f}</b> / MWh")
     if congestion is not None:
         lineas.append(f"CM Congestión: <b>S/ {congestion:,.2f}</b> / MWh")
-    lineas.append(f"CM Total: <b>S/ {total:,.2f}</b> / MWh")
+    if total is not None:
+        lineas.append(f"CM Total: <b>S/ {total:,.2f}</b> / MWh")
     mensaje = "\n".join(lineas)
 
     es_nuevo = (
@@ -491,7 +480,7 @@ def ejecutar_iteracion():
         or estado.get("ultimo_valor") != total
     )
 
-    if total > UMBRAL_S_POR_MWH and es_nuevo and en_horario_sonido(ahora):
+    if (total is not None) and (total > UMBRAL_S_POR_MWH) and es_nuevo and en_horario_sonido(ahora):
         enviar_telegram(mensaje + "\n\n⚠️ Superó el umbral configurado (S/ {:.2f} por MWh).".format(UMBRAL_S_POR_MWH))
         estado["ultimo_envio_ts"] = ahora.isoformat()
         estado["ultimo_registro_hora"] = ts_local.strftime("%Y-%m-%d %H:%M")
@@ -500,10 +489,10 @@ def ejecutar_iteracion():
         print(f"[OK] Alerta enviada.")
     else:
         motivo = []
-        if total <= UMBRAL_S_POR_MWH: motivo.append("<= umbral")
+        if total is None or total <= UMBRAL_S_POR_MWH: motivo.append("<= umbral")
         if not es_nuevo: motivo.append("dato repetido")
         if not en_horario_sonido(ahora): motivo.append("horario silencioso")
-        print(f"[INFO] {ts_local:%Y-%m-%d %H:%M} | {dato['barra']} = Total S/ {total:.2f} ({', '.join(motivo) or 'sin alerta'}).")
+        print(f"[INFO] {ts_local:%Y-%m-%d %H:%M} | {dato['barra']} = Total {('S/ ' + f'{total:.2f}') if total is not None else 'N/D'} ({', '.join(motivo) or 'sin alerta'}).")
 
 def main():
     if ONESHOT:
