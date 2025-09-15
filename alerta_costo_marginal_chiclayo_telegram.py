@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Alerta COES → Telegram (CHICLAYO 220) con Playwright
-v3: Modo ONE-SHOT para GitHub Actions + Persistencia opcional en Gist
+Flujo: Buscar → Datos → Exportar Excel → Parsear Excel
 """
 
 import os, time, json, re, io
 import pandas as pd
 import requests
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 try:
@@ -17,6 +17,8 @@ except Exception:
     pass
 
 from playwright.sync_api import sync_playwright
+
+# ==================== CONFIG ====================
 
 BARRA_BUSCADA = os.getenv("BARRA_BUSCADA", "CHICLAYO 220")
 UMBRAL_S_POR_MWH = float(os.getenv("UMBRAL_S_POR_MWH", "400"))
@@ -39,6 +41,8 @@ URL_COSTOS_TIEMPO_REAL = os.getenv(
     "URL_COSTOS_TIEMPO_REAL",
     "https://www.coes.org.pe/Portal/mercadomayorista/costosmarginales/index"
 )
+
+# ==================== UTILS ====================
 
 def _parse_hhmm(s: str):
     try:
@@ -131,120 +135,6 @@ def enviar_telegram(mensaje: str):
     r.raise_for_status()
     return r.json()
 
-# -------------------- Parsing helpers --------------------
-
-def _find_header_row(raw: pd.DataFrame) -> int:
-    sraw = raw.astype(str)
-    has_hora  = sraw.apply(lambda r: r.str.contains(r"\bhora\b", case=False, na=False).any(), axis=1)
-    has_barra = sraw.apply(lambda r: r.str.contains(r"\bbarra\b", case=False, na=False).any(), axis=1)
-    idxs = sraw.index[(has_hora) & (has_barra)].tolist()
-    if not idxs:
-        raise RuntimeError("No se encontró encabezado con 'Hora' y 'Barra' en el Excel exportado.")
-    return idxs[0]
-
-def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
-    raw = pd.read_excel(io.BytesIO(binary), header=None, engine="openpyxl")
-    hdr = _find_header_row(raw)
-    header_row = raw.loc[hdr, :].tolist()
-    first_non_null = next((i for i, v in enumerate(header_row) if pd.notna(v)), 0)
-    cols = [str(c).strip() for c in raw.loc[hdr, first_non_null:].tolist()]
-    data = raw.loc[hdr+1:, first_non_null:].copy()
-    data.columns = cols
-    data = data.dropna(how="all")
-
-    def find_col(pattern):
-        return next((c for c in data.columns if re.search(pattern, str(c), re.I)), None)
-
-    col_hora = find_col(r"\bhora\b")
-    col_barra = find_col(r"\bbarra\b")
-    col_cm_energia = find_col(r"cm\s*energ")
-    col_cm_cong   = find_col(r"cm\s*conges")
-    col_cm_total  = find_col(r"cm\s*total")
-
-    if not (col_hora and col_barra and col_cm_total):
-        raise RuntimeError("Faltan columnas clave (Hora, Barra, CM Total).")
-
-    keep = [col_hora, col_barra, col_cm_total]
-    if col_cm_energia: keep.insert(2, col_cm_energia)
-    if col_cm_cong:    keep.insert(3 if col_cm_energia else 2, col_cm_cong)
-
-    df = data[keep].copy()
-    rename_map = {col_hora: "Hora", col_barra: "Barra", col_cm_total: "CM_Total"}
-    if col_cm_energia: rename_map[col_cm_energia] = "CM_Energia"
-    if col_cm_cong:    rename_map[col_cm_cong]    = "CM_Congestion"
-    df = df.rename(columns=rename_map)
-
-    # <-- FIX: quitado el ']' extra en el for
-    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
-        if c in df.columns:
-            df[c] = (
-                df[c].astype(str)
-                .str.replace(",", ".", regex=False)
-                .str.extract(r"([-]?[0-9]+(?:\.[0-9]+)?)")[0]
-                .astype(float)
-            )
-    df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
-    return df
-
-def leer_tabla_html(html: str) -> pd.DataFrame:
-    import io as _io
-    tablas = pd.read_html(_io.StringIO(html))
-    if not tablas:
-        raise RuntimeError("No se encontraron tablas en HTML.")
-
-    barra_pats    = [r"\bbarra\b", r"\bnodo\b", r"\bpunto\b"]
-    cm_total_pats = [r"cm\s*total", r"costo\s*marginal\s*total"]
-    cm_ener_pats  = [r"cm\s*energ", r"costo\s*marginal\s*energ"]
-    cm_cong_pats  = [r"cm\s*conges"]
-
-    def _find_col(cols, pats):
-        for c in cols:
-            s = str(c)
-            if any(re.search(p, s, re.I) for p in pats):
-                return c
-        return None
-
-    for t in tablas:
-        data = t.copy()
-        cols = list(data.columns)
-
-        col_barra = _find_col(cols, barra_pats)
-        col_total = _find_col(cols, cm_total_pats)
-        col_ener  = _find_col(cols, cm_ener_pats)
-        col_cong  = _find_col(cols, cm_cong_pats)
-        col_hora  = _find_col(cols, [r"\bhora\b"])
-
-        if not col_barra or not (col_total or col_ener or col_cong):
-            continue
-
-        keep = [c for c in [col_hora, col_barra, col_ener, col_cong, col_total] if c is not None]
-        df = data[keep].copy()
-
-        rename_map = {col_barra: "Barra"}
-        if col_hora:  rename_map[col_hora]  = "Hora"
-        if col_ener:  rename_map[col_ener]  = "CM_Energia"
-        if col_cong:  rename_map[col_cong]  = "CM_Congestion"
-        if col_total: rename_map[col_total] = "CM_Total"
-        df = df.rename(columns=rename_map)
-
-        for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
-            if c in df.columns:
-                df[c] = (
-                    df[c].astype(str)
-                    .str.replace(",", ".", regex=False)
-                    .str.extract(r"([-]?[0-9]+(?:\.[0-9]+)?)")[0]
-                    .astype(float)
-                )
-
-        if "Hora" in df.columns:
-            df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
-        else:
-            df["ts"] = pd.Timestamp.now(tz=TZ)
-
-        return df
-
-    raise RuntimeError("No se encontró una tabla HTML con columnas esperadas (Barra/Nodo y CM).")
-
 # -------------------- Normalización barra --------------------
 
 def _norm_barra(s: str) -> str:
@@ -258,6 +148,8 @@ def _norm_barra(s: str) -> str:
 def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame:
     objetivo = _norm_barra(barra_objetivo)
     df = df.copy()
+    if "Barra" not in df.columns:
+        raise RuntimeError("El Excel exportado no contiene columna 'Barra/Nodo/Punto' reconocible.")
     df["Barra_norm"] = df["Barra"].map(_norm_barra)
 
     ciudad = _norm_barra("CHICLAYO")
@@ -275,20 +167,133 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
     con220 = candidatos[candidatos["Barra_norm"].str.contains("220", na=False)]
     return con220 if not con220.empty else candidatos
 
-# ==================== NAVEGACIÓN / WEB ====================
+# -------------------- Excel parser (flexible) --------------------
+
+def _col(df_cols, *pats):
+    for c in df_cols:
+        s = str(c)
+        if any(re.search(p, s, re.I) for p in pats):
+            return c
+    return None
+
+def _excel_hora_to_hhmm(val) -> str | None:
+    if pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        total_min = int(round(float(val) * 24 * 60))
+        hh, mm = divmod(total_min, 60)
+        return f"{hh:02d}:{mm:02d}"
+    s = str(val).strip()
+    m = re.search(r"(\d{1,2}):(\d{2})", s)
+    if m:
+        return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    # último recurso: puede venir como datetime
+    try:
+        dt = pd.to_datetime(val, errors="coerce")
+        if pd.notna(dt):
+            return f"{dt.hour:02d}:{dt.minute:02d}"
+    except Exception:
+        pass
+    return None
+
+def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
+    # lee sin asumir encabezado en primera fila
+    raw = pd.read_excel(io.BytesIO(binary), header=None, engine="openpyxl")
+    sraw = raw.astype(str)
+
+    # tratar de ubicar fila de encabezados
+    fila_hdr = None
+    for i in range(len(sraw)):
+        fila = " | ".join(list(sraw.iloc[i, :]))
+        if re.search(r"\bhora\b", fila, re.I) and (re.search(r"\bbarra\b|\bnodo\b|\bpunto\b", fila, re.I)):
+            fila_hdr = i
+            break
+    if fila_hdr is None:
+        # si no encuentra, asumir primera fila como header
+        fila_hdr = 0
+
+    header_row = raw.iloc[fila_hdr, :].tolist()
+    first_non_null = next((i for i, v in enumerate(header_row) if pd.notna(v)), 0)
+    cols = [str(c).strip() for c in raw.iloc[fila_hdr, first_non_null:].tolist()]
+
+    data = raw.iloc[fila_hdr + 1:, first_non_null:].copy()
+    data.columns = cols
+    data = data.dropna(how="all")
+
+    # mapear nombres
+    col_barra = _col(data.columns, r"\bbarra\b", r"\bnodo\b", r"\bpunto\b")
+    col_hora  = _col(data.columns, r"\bhora\b")
+    col_fecha = _col(data.columns, r"\b(fecha|día)\b")
+    col_en    = _col(data.columns, r"cm\s*energ", r"costo\s*marginal\s*energ")
+    col_cg    = _col(data.columns, r"cm\s*conges")
+    col_to    = _col(data.columns, r"cm\s*total", r"costo\s*marginal\s*total")
+
+    if not col_barra or not col_hora or not col_to:
+        raise RuntimeError("Excel exportado sin columnas clave (Barra/Nodo, Hora, CM Total).")
+
+    keep = [c for c in [col_fecha, col_hora, col_barra, col_en, col_cg, col_to] if c is not None]
+    df = data[keep].copy()
+
+    rename = {col_barra: "Barra", col_hora: "Hora", col_to: "CM_Total"}
+    if col_fecha: rename[col_fecha] = "Fecha"
+    if col_en:    rename[col_en]    = "CM_Energia"
+    if col_cg:    rename[col_cg]    = "CM_Congestion"
+    df = df.rename(columns=rename)
+
+    # limpiar números
+    for c in ["CM_Energia", "CM_Congestion", "CM_Total"]:
+        if c in df.columns:
+            df[c] = (
+                df[c]
+                .astype(str)
+                .str.replace("\u00a0", " ", regex=False)
+                .str.replace(",", ".", regex=False)
+                .str.extract(r"([-]?\d+(?:\.\d+)?)")[0]
+                .astype(float, errors="ignore")
+            )
+
+    # normalizar Hora / Fecha → ts
+    if "Hora" in df.columns:
+        df["Hora_norm"] = df["Hora"].map(_excel_hora_to_hhmm)
+    else:
+        df["Hora_norm"] = None
+
+    if "Fecha" in df.columns:
+        base_fecha = df["Fecha"].astype(str).str.replace("\u00a0", " ", regex=False).str.strip()
+    else:
+        # si el Excel no trae fecha, usar HOY (la consulta siempre es del día)
+        base_fecha = pd.Series([datetime.now(TZ).strftime("%d/%m/%Y")] * len(df))
+
+    df["ts"] = pd.to_datetime(
+        (base_fecha + " " + df["Hora_norm"].fillna("").astype(str)).str.strip(),
+        dayfirst=True, errors="coerce"
+    )
+    # fallback si arriba fallara
+    if df["ts"].isna().all() and "Hora" in df.columns:
+        df["ts"] = pd.to_datetime(df["Hora"].astype(str), dayfirst=True, errors="coerce")
+
+    # proyectar a TZ local
+    df["ts"] = df["ts"].dt.tz_localize(TZ, nonexistent="NaT", ambiguous="NaT", errors="coerce")
+
+    # estandarizar nombre de barra
+    df["Barra"] = df["Barra"].astype(str)
+
+    return df.dropna(how="all")
+
+# ==================== WEB (Exportar Excel) ====================
 
 def obtener_ultimo_costo_por_export(timeout_ms=120000):
     """
-    Flujo robusto:
-      - Cierra modal "Aviso".
-      - FECHA = hoy (dd/mm/yyyy) y dispara change/input/blur.
-      - Abre el dropdown de HORA, lista opciones, screenshot (step2a_horas_dropdown.png).
-      - Selecciona la media hora más cercana por debajo de la hora actual (fallback bajando).
-      - Buscar → Datos, con reintento si aparece "Se ha producido un error" o la hora queda vacía.
-      - Busca la barra con buscador/paginación y parsea la tabla final.
+    Flujo robusto (sin pelear con la hora en UI):
+      1) Ir a la URL, cerrar 'Aceptar' (si aparece).   → step1/step2
+      2) Poner FECHA de HOY (dd/mm/yyyy).              → step2
+         (solo para que el sitio cargue el día correcto)
+      3) (Auditoría) Abrir desplegable de horas si existe. → step2a
+      4) Click 'Buscar' y luego 'Datos'.                → step3/step4
+      5) Click 'Exportar Excel' y capturar descarga.    → step5
+      6) Leer 'export_debug.xlsx', filtrar barra y elegir la
+         hora más cercana <= ahora; si no hay, bajar 30 min sucesivamente.
     """
-    from io import StringIO
-
     def _screenshot(page, name):
         try: page.screenshot(path=name)
         except Exception: pass
@@ -312,13 +317,11 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
             except Exception: pass
         return False
 
-    # ---------- helpers fecha / hora ----------
-
     def _cerrar_aviso(page):
         _click_possibles(page, [r"^Aceptar$", "Aceptar", r"×", r"X"])
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(200)
 
-    def _fecha_input_locator(page):
+    def _fecha_input(page):
         for sel in ["#txtFecha", "#TxtFecha", "#fecha",
                     "input[name='fecha']", "input[placeholder*='Fecha' i]",
                     "xpath=//label[contains(normalize-space(.),'Fecha')]/following::input[1]"]:
@@ -330,195 +333,60 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
                 pass
         return None
 
-    def _set_fecha_hoy_ddmmyyyy(page):
+    def _set_fecha_hoy(page):
         hoy = datetime.now(TZ).strftime("%d/%m/%Y")
-        inp = _fecha_input_locator(page)
-        if not inp: return False
+        inp = _fecha_input(page)
+        if not inp: return
         try:
-            inp.click()
-            inp.fill("")
-            inp.type(hoy, delay=20)
-            # forzar que repueble horas
-            page.evaluate("(el)=>{el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));el.blur();}", inp)
-            page.wait_for_timeout(300)
-            return True
+            inp.click(); inp.fill(""); inp.type(hoy, delay=20)
+            # disparar eventos para que el sitio calcule
+            page.evaluate("(el)=>{el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}", inp)
+            inp.press("Enter")
+            page.wait_for_timeout(250)
         except Exception:
-            return False
+            pass
 
-    def _wait_horas_pobladas(page, timeout=7000):
-        return page.wait_for_function(
-            """() => {
-                const sel = document.querySelector('#cbHoras')
-                    || document.querySelector("select[name='hora']")
-                    || Array.from(document.querySelectorAll('select')).find(s =>
-                        Array.from(s.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent||'').trim())));
-                if (!sel || sel.disabled) return false;
-                const ok = Array.from(sel.options).some(o => /^\\d{1,2}:\\d{2}$/.test((o.value||o.textContent||'').trim()));
-                return ok;
-            }""",
-            timeout=timeout
-        )
-
-    def _abrir_dropdown_horas_y_listar(page):
-        sel = None
+    def _abrir_dropdown_horas(page):
+        # Solo para step de auditoría (no dependemos de fijar hora)
         for css in ["#cbHoras", "select[name='hora']"]:
             try:
                 loc = page.locator(css)
-                if loc.count() > 0:
-                    sel = loc.first
+                if loc.count() > 0 and loc.first.is_visible():
+                    loc.first.click(); _screenshot(page, "step2a_horas_dropdown.png")
                     break
             except Exception:
-                pass
-        if not sel:
-            try:
-                selects = page.locator("select")
-                n = selects.count()
-                for i in range(n):
-                    cand = selects.nth(i)
-                    texts = [t.strip() for t in cand.locator("option").all_inner_texts()]
-                    if any(re.match(r"^\d{1,2}:\d{2}$", t) for t in texts):
-                        sel = cand
-                        break
-            except Exception:
-                pass
-        if not sel:
-            return None, []
-
-        try:
-            sel.click()  # abre el desplegable
-            _screenshot(page, "step2a_horas_dropdown.png")
-        except Exception:
-            pass
-
-        try:
-            opciones = page.evaluate(
-                """(s) => {
-                    const el = s;
-                    const reg = /^\\d{1,2}:\\d{2}$/;
-                    return Array.from(el.options)
-                                .map(o => ({value:(o.value||'').trim(), text:(o.textContent||'').trim()}))
-                                .filter(o => reg.test(o.value)||reg.test(o.text));
-                }""",
-                sel
-            )
-        except Exception:
-            opciones = []
-
-        return sel, opciones
-
-    def _minutos(hhmm: str) -> int:
-        h, m = hhmm.split(":")
-        return int(h)*60 + int(m)
-
-    def _set_hora_mas_cercana(page, sel, opciones):
-        if not opciones:
-            return False
-        ahora = datetime.now(TZ)
-        base = (ahora.hour*60 + ahora.minute) // 30 * 30  # redondeo hacia abajo a múltiplo de 30
-        mins_opcs = sorted({_minutos((o["value"] or o["text"])) for o in opciones})
-        candidatos = []
-        for k in range(0, 24*60, 30):
-            m = base - 30*k
-            if m < 0:
-                break
-            candidatos.append(m)
-        elegido_min = None
-        for cand in candidatos:
-            if cand in mins_opcs:
-                elegido_min = cand
-                break
-        if elegido_min is None:
-            elegido_min = max(mins_opcs)
-
-        hh = elegido_min // 60
-        mm = elegido_min % 60
-        target = f"{hh:02d}:{mm:02d}"
-
-        try:
-            tiene_value = any((o["value"] == target) for o in opciones)
-            if tiene_value:
-                sel.select_option(value=target)
-            else:
-                sel.select_option(label=target)
-            page.wait_for_function(
-                """(exp, s) => {
-                    const el = s;
-                    const v = (el.value || el.options[el.selectedIndex]?.text || '').trim();
-                    return v === exp;
-                }""",
-                target, sel, timeout=3000
-            )
-            return True
-        except Exception:
-            return False
-
-    def _retroceder_media_hora(page, sel):
-        try:
-            opciones = page.evaluate(
-                """(s) => Array.from(s.options).map(o => (o.value||o.textContent||'').trim())""",
-                sel
-            )
-            opciones = [o for o in opciones if re.match(r"^\d{1,2}:\d{2}$", o)]
-            if not opciones:
-                return False
-            actual = page.evaluate("""(s)=> (s.value || s.options[s.selectedIndex]?.text || '').trim()""", sel)
-            if actual in opciones:
-                idx = opciones.index(actual)
-                if idx > 0:
-                    prev = opciones[idx-1]
-                    try:
-                        sel.select_option(value=prev)
-                    except Exception:
-                        sel.select_option(label=prev)
-                    page.wait_for_timeout(200)
-                    return True
-        except Exception:
-            pass
-        return False
+                continue
 
     def _abrir_datos(page):
-        if _click_possibles(page, [r"^Datos$", "Datos"], timeout=5000): return True
+        if _click_possibles(page, [r"^Datos$", "Datos"], timeout=6000): return True
         try:
-            page.locator("[data-fuente='datos'], [aria-controls*=Datos], [data-target*=Datos]").first.click(timeout=4000)
+            page.locator("[data-fuente='datos'], [aria-controls*=Datos], [data-target*=Datos]").first.click(timeout=6000)
             return True
         except Exception:
             return False
 
-    def _buscar_input_datatables(page):
+    def _click_export(page):
+        # Intentar variantes comunes del botón de exportación
+        textos = [r"^Exportar\s*Excel$", r"Exportar Excel", r"^Exportar$", r"Excel"]
+        if _click_possibles(page, textos, timeout=8000): return True
+        # enlaces / iconos
         for sel in [
-            "div.dataTables_wrapper div.dataTables_filter input[type='search']",
-            "#resultado .dataTables_filter input[type='search']",
-            "div.dataTables_filter input",
-            "input[aria-label='Search']",
-            "xpath=//*[contains(normalize-space(.),'Mostrar número de filas')]/following::input[1]",
+            "a[download$='.xlsx']", "a[href*='Export']",
+            "button:has(svg)", "a:has(svg)"
         ]:
             try:
                 loc = page.locator(sel)
-                if loc.count() > 0 and loc.first.is_visible(): return loc.first
+                if loc.count() > 0 and loc.first.is_visible():
+                    loc.first.click(timeout=6000); return True
             except Exception:
                 pass
-        return None
+        return False
 
-    def _tabla_html(page):
-        try:
-            page.wait_for_selector("#resultado table tbody tr, #resultado .dataTables_empty, .dataTables_wrapper table", timeout=8000)
-        except Exception:
-            pass
-        try:
-            t = page.locator("#resultado table").first
-            if t.count() == 0: t = page.locator(".dataTables_wrapper table").first
-            return t.evaluate("el => el.outerHTML")
-        except Exception:
-            return None
-
-    def _tabla_contiene_barra(html, barra):
-        if not html: return False
-        return (barra or "").upper().replace(" ", "") in re.sub(r"\s+", "", html.upper())
-
-    # -------------------- navegación --------------------
+    # --------- Navegación + descarga ---------
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1366, "height": 900})
+        context = browser.new_context(accept_downloads=True)
+        page = context.new_page(viewport={"width": 1366, "height": 900})
 
         page.goto(URL_COSTOS_TIEMPO_REAL, wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_load_state("networkidle")
@@ -527,146 +395,117 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
         _cerrar_aviso(page)
         _screenshot(page, "step2_modal_closed.png")
 
-        # 1) FECHA hoy dd/mm/yyyy  -> repuebla horas
-        _set_fecha_hoy_ddmmyyyy(page)
-        try: _wait_horas_pobladas(page, timeout=8000)
-        except Exception: pass
+        _set_fecha_hoy(page)
+        _abrir_dropdown_horas(page)  # solo para el step de evidencia
 
-        # 2) Abrir dropdown horas, screenshot y elegir media hora más cercana por debajo
-        sel_hora, opciones = _abrir_dropdown_horas_y_listar(page)
-        if not opciones:
-            browser.close()
-            raise RuntimeError("No se pudo leer el combo de 'Hora' (sin opciones).")
-        if not _set_hora_mas_cercana(page, sel_hora, opciones):
-            browser.close()
-            raise RuntimeError("No fue posible fijar una hora válida.")
-
-        page.wait_for_timeout(250)
-
-        # 3) Buscar
+        # Buscar
         _click_possibles(page, [r"^Buscar$", "Buscar"])
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(600)
-
-        # 3b) Si hay error o la hora quedó vacía, retroceder media hora y reintentar una vez
-        try:
-            error_flag = page.locator("text=/Se ha producido un error/i").count() > 0
-            valor_hora = page.locator("#cbHoras, select[name='hora']").first.input_value()
-            if error_flag or not valor_hora:
-                if sel_hora and _retroceder_media_hora(page, sel_hora):
-                    _click_possibles(page, [r"^Buscar$", "Buscar"])
-                    page.wait_for_load_state("networkidle")
-                    page.wait_for_timeout(600)
-        except Exception:
-            pass
-
         _screenshot(page, "step3_clicked_buscar.png")
 
-        # 4) Datos
+        # Datos
         if not _abrir_datos(page):
             _screenshot(page, "step4_no_datos_tab.png")
-            browser.close()
+            context.close(); browser.close()
             raise RuntimeError("No se pudo abrir la pestaña 'Datos'.")
         page.wait_for_timeout(600)
         _screenshot(page, "step4_tab_datos.png")
 
-        # 5) Buscador / paginación
-        buscador, html_tabla = _buscar_input_datatables(page), None
-        if buscador is not None:
-            try:
-                buscador.fill("")
-                buscador.type(BARRA_BUSCADA, delay=18)
-                page.wait_for_function(
-                    """(texto)=>{const u=(texto||'').toUpperCase();
-                       const wrap=document.querySelector('#resultado')||document;
-                       const t=wrap.querySelector('table'); if(!t) return false;
-                       const rows=t.querySelectorAll('tbody tr');
-                       return Array.from(rows).some(r=>r.innerText.toUpperCase().includes(u));}""",
-                    BARRA_BUSCADA, timeout=9000
-                )
-                html_tabla = _tabla_html(page)
-            except Exception:
-                pass
-
-        if not html_tabla:
-            html = _tabla_html(page)
-            if _tabla_contiene_barra(html, BARRA_BUSCADA):
-                html_tabla = html
-            else:
-                def _sel_siguiente():
-                    for s in [
-                        ".dataTables_paginate .paginate_button.next:not(.disabled)",
-                        "a.paginate_button.next:not(.disabled)",
-                        "a:has-text('Siguiente'):not(.disabled)",
-                        "a:has-text('›')", "a:has-text('»')",
-                    ]:
-                        try:
-                            if page.locator(s).count() > 0 and page.locator(s).first.is_visible(): return s
-                        except Exception: pass
-                    return None
-
-                for _ in range(60):
-                    nxt = _sel_siguiente()
-                    if not nxt: break
-                    try:
-                        page.locator(nxt).first.click(); page.wait_for_timeout(450)
-                        html = _tabla_html(page)
-                        if _tabla_contiene_barra(html, BARRA_BUSCADA):
-                            html_tabla = html; break
-                    except Exception:
-                        break
-
-        if not html_tabla:
-            _screenshot(page, "step5_no_table.png")
-            browser.close()
-            raise RuntimeError("No se encontró ninguna tabla en 'Datos'.")
-
+        # Exportar Excel (capturar download)
+        save_to = "export_debug.xlsx"
         try:
-            with open("datos_tabla.html", "w", encoding="utf-8") as f:
-                f.write(html_tabla)
-        except Exception:
-            pass
+            with page.expect_download(timeout=20000) as dl_info:
+                clicked = _click_export(page)
+                if not clicked:
+                    _screenshot(page, "step5_export_not_found.png")
+                    context.close(); browser.close()
+                    raise RuntimeError("No se encontró el botón de 'Exportar Excel'.")
+            download = dl_info.value
+            # Guardar a un nombre estable para los artifacts
+            download.save_as(save_to)
+            _screenshot(page, "step5_export_clicked.png")
+        except Exception as e:
+            _screenshot(page, "step5_export_failed.png")
+            context.close(); browser.close()
+            raise RuntimeError(f"Falló la exportación del Excel: {e}")
 
+        # Leer binarios
+        try:
+            with open(save_to, "rb") as f:
+                binary = f.read()
+        except Exception as e:
+            context.close(); browser.close()
+            raise RuntimeError(f"No se pudo abrir el Excel descargado: {e}")
+
+        context.close()
         browser.close()
 
-    # ---- Parseo y selección del último registro ----
-    tablas = pd.read_html(StringIO(html_tabla))
-    if not tablas:
-        raise RuntimeError("No se pudo parsear la tabla de 'Datos' a DataFrame.")
-    df = tablas[0].copy()
+    # --------- Parseo y elección de hora ---------
+    df = leer_excel_exportado_en_memoria(binary)
 
-    def fcol(pat): return next((c for c in df.columns if re.search(pat, str(c), re.I)), None)
-    col_hora = fcol(r"\bhora\b")
-    col_barra = fcol(r"\b(Barra|Nodo|Punto)\b")
-    col_cm_en = fcol(r"cm\s*energ")
-    col_cm_co = fcol(r"cm\s*conges")
-    col_cm_to = fcol(r"(cm\s*total|costo\s*marginal\s*total)")
-    if not (col_hora and col_barra and col_cm_to):
-        raise RuntimeError("No se encontró una tabla con columnas esperadas (Hora/Barra/CM Total).")
+    # mapear columnas de nombres alternos -> estándar
+    def _map_barra(df):
+        for c in df.columns:
+            if re.search(r"\b(Barra|Nodo|Punto)\b", str(c), re.I):
+                if c != "Barra":
+                    df = df.rename(columns={c: "Barra"})
+                return df
+        return df
 
-    df = df.rename(columns={
-        col_hora: "Hora", col_barra: "Barra", col_cm_to: "CM_Total",
-        **({col_cm_en: "CM_Energia"} if col_cm_en else {}),
-        **({col_cm_co: "CM_Congestion"} if col_cm_co else {}),
-    })
-    for c in ["CM_Energia","CM_Congestion","CM_Total"]:
-        if c in df.columns:
-            df[c] = (df[c].astype(str)
-                         .str.replace(",", ".", regex=False)
-                         .str.extract(r"([-]?\d+(?:\.\d+)?)")[0]
-                         .astype(float))
-    df["ts"] = pd.to_datetime(df["Hora"], dayfirst=True, errors="coerce")
+    df = _map_barra(df)
 
+    # Filtro de barra robusto
     df = filtrar_barra_robusto(df, BARRA_BUSCADA)
-    if df.empty:
-        raise RuntimeError(f"No se obtuvo ningún registro para '{BARRA_BUSCADA}' tras filtrar la tabla.")
-    df = df.sort_values("ts")
-    row = df.iloc[-1]
-    energia = float(row["CM_Energia"]) if "CM_Energia" in df.columns else None
-    congestion = float(row["CM_Congestion"]) if "CM_Congestion" in df.columns else None
-    total = float(row["CM_Total"])
+
+    if "ts" not in df.columns or df["ts"].isna().all():
+        # construir ts a partir de hoy + Hora_norm si todo falló
+        hoy = datetime.now(TZ).strftime("%d/%m/%Y")
+        if "Hora_norm" in df.columns:
+            df["ts"] = pd.to_datetime(hoy + " " + df["Hora_norm"].fillna("00:00"), dayfirst=True, errors="coerce").dt.tz_localize(TZ)
+        else:
+            raise RuntimeError("No se pudo construir la columna temporal (ts) desde el Excel.")
+
+    # Elegir la hora mas cercana hacia atrás (<= ahora). Si no hay, descender en bloques de 30 min.
+    ahora = datetime.now(TZ)
+    df_ok = df[df["ts"] <= ahora].copy()
+    if df_ok.empty:
+        # todo futuro → elegir el mínimo ts disponible
+        ts_pick = df["ts"].min()
+    else:
+        ts_pick = df_ok["ts"].max()
+
+    # si aun así NaT, bajar manualmente 30m hasta encontrar
+    if pd.isna(ts_pick):
+        cand = ahora
+        found = None
+        for _ in range(48):  # hasta 24 horas hacia atrás
+            cand -= timedelta(minutes=30)
+            tmp = df[df["ts"] == cand]
+            if not tmp.empty:
+                found = cand
+                break
+        ts_pick = found if found else df["ts"].dropna().max()
+
+    if pd.isna(ts_pick):
+        raise RuntimeError("No se encontró un registro horario válido en el Excel exportado.")
+
+    # quedarnos con esa hora
+    elegido = df[df["ts"] == ts_pick].copy()
+    if elegido.empty:
+        # buscar el más cercano hacia abajo
+        elegido = df.sort_values("ts").iloc[[-1]]
+
+    row = elegido.iloc[0]
+
+    energia = float(row["CM_Energia"]) if "CM_Energia" in elegido.columns and pd.notna(row["CM_Energia"]) else None
+    congestion = float(row["CM_Congestion"]) if "CM_Congestion" in elegido.columns and pd.notna(row["CM_Congestion"]) else None
+    total = float(row["CM_Total"]) if pd.notna(row["CM_Total"]) else None
+
     ts = row["ts"]
-    if ts.tzinfo is None: ts = ts.tz_localize(TZ)
+    if ts is not None and ts.tzinfo is None:
+        ts = ts.tz_localize(TZ)
+
     return {"barra": row["Barra"], "ts": ts, "energia": energia, "congestion": congestion, "total": total}
 
 # ==================== LOOP ====================
@@ -720,3 +559,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
