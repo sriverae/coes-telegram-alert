@@ -1,7 +1,7 @@
 name: COES Alert
 on:
   schedule:
-    - cron: "*/30 * * * *"   # cada 30 min (UTC)
+    - cron: "0,30 * * * *"   # cada 30 min (UTC)
   workflow_dispatch:
 
 permissions:
@@ -62,4 +62,11 @@ jobs:
             frame_*.html
             page_after_buscar.png
           if-no-files-found: ignore
+      
+      - name: Show times
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "UTC now:   $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
+          TZ=America/Lima date '+Lima now:  %Y-%m-%d %H:%M:%S %Z'
+
   
