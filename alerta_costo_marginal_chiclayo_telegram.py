@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Alerta COES → Telegram (CHICLAYO 220) con Playwright
-Modo: Exportar Masivo → leer Excel en memoria
+Alerta COES → Telegram (CHICLAYO 220)
+Flujo principal:
+  - Plan A: leer Excel local (EXCEL_FILE o export_debug.xlsx) y mandar alerta.
+  - Plan B: si no hay Excel local, usar Playwright → Exportar Masivo → capturar Excel en memoria.
+El parser reconoce: FECHA HORA, NOMBRE BARRA, ENERGÍA, CONGESTIÓN, TOTAL.
 """
 
 import os, time, json, re, io
@@ -41,6 +44,9 @@ URL_COSTOS_TIEMPO_REAL = os.getenv(
     "URL_COSTOS_TIEMPO_REAL",
     "https://www.coes.org.pe/Portal/mercadomayorista/costosmarginales/index"
 )
+
+# Excel local opcional para Plan A
+EXCEL_FILE = os.getenv("EXCEL_FILE", "export_debug.xlsx")
 
 # ==================== UTILIDADES HORARIO ====================
 
@@ -151,7 +157,7 @@ def _find_header_row_export(raw: pd.DataFrame) -> tuple[int, int]:
             hdr_idx = i
             break
     if hdr_idx is None:
-        raise RuntimeError("No se encontró el encabezado en el Excel exportado (busqué 'FECHA HORA' y 'NOMBRE BARRA').")
+        raise RuntimeError("No se encontró el encabezado en el Excel (busqué 'FECHA HORA' y 'NOMBRE BARRA').")
 
     header_row = sraw.loc[hdr_idx].tolist()
     first_non_null = next((j for j, v in enumerate(header_row) if str(v).strip() not in ("", "nan", "None")), 0)
@@ -173,18 +179,25 @@ def _norm_barra(s: str) -> str:
     t = t.replace(".", "")
     return t
 
-def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
+def _parse_excel_like(binary_or_path) -> pd.DataFrame:
     """
-    Lee el Excel de 'Exportar Masivo' y retorna un DF con columnas:
-    ['ts','Barra','CM_Energia','CM_Congestion','CM_Total']
+    Devuelve DF con columnas: ['ts','Barra','CM_Energia','CM_Congestion','CM_Total'].
+    Acepta bytes o ruta de archivo.
     """
-    # Intentar hoja específica; si cambia, leo la primera
+    if isinstance(binary_or_path, (bytes, bytearray)):
+        bio = io.BytesIO(binary_or_path)
+    else:
+        with open(binary_or_path, "rb") as f:
+            bio = io.BytesIO(f.read())
+
     try:
-        xls = pd.ExcelFile(io.BytesIO(binary))
+        xls = pd.ExcelFile(bio)
         sheet = "COSTOMARGINAL" if "COSTOMARGINAL" in xls.sheet_names else xls.sheet_names[0]
-        raw = pd.read_excel(io.BytesIO(binary), header=None, sheet_name=sheet, engine="openpyxl")
+        bio.seek(0)
+        raw = pd.read_excel(bio, header=None, sheet_name=sheet, engine="openpyxl")
     except Exception:
-        raw = pd.read_excel(io.BytesIO(binary), header=None, engine="openpyxl")
+        bio.seek(0)
+        raw = pd.read_excel(bio, header=None, engine="openpyxl")
 
     hdr, c0 = _find_header_row_export(raw)
     data = raw.iloc[hdr+1:, c0:].copy()
@@ -192,7 +205,6 @@ def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
     data.columns = cols
     data = data.dropna(how="all").copy()
 
-    # Mapeo tolerante por nombres (con o sin acentos)
     def fcol(patterns):
         for p in patterns:
             for c in data.columns:
@@ -211,62 +223,65 @@ def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
 
     out = pd.DataFrame()
     out["Barra"] = data[col_bar].astype(str)
-    # Valores numéricos
+
     if col_en:  out["CM_Energia"]    = _clean_numeric_series(data[col_en])
     if col_con: out["CM_Congestion"] = _clean_numeric_series(data[col_con])
     if col_tot: out["CM_Total"]      = _clean_numeric_series(data[col_tot])
 
-    # Timestamp
     out["ts"] = pd.to_datetime(data[col_fh].astype(str), dayfirst=True, errors="coerce")
-    # Localizar a Lima si viene naïve
     out["ts"] = out["ts"].dt.tz_localize(TZ, nonexistent="shift_forward", ambiguous="NaT", errors="coerce")
 
-    # Filtrado de barra robusto
-    objetivo = _norm_barra(BARRA_BUSCADA)
-    out["Barra_norm"] = out["Barra"].map(_norm_barra)
+    return out
 
-    # ejemplos: "CHICLAYO 220", "CHICLAYO220", "CHICLAOE220" (código en NODO EMD)
+def _pick_record(df: pd.DataFrame, barra_objetivo: str):
+    objetivo = _norm_barra(barra_objetivo)
+    dfx = df.copy()
+    dfx["Barra_norm"] = dfx["Barra"].map(_norm_barra)
     mask = (
-        out["Barra_norm"].str.contains(objetivo, na=False)
-        | out["Barra_norm"].str.contains("CHICLAYO220", na=False)
-        | out["Barra_norm"].str.contains(r"CHICLAYO220K?V?", na=False)
+        dfx["Barra_norm"].str.contains(objetivo, na=False)
+        | dfx["Barra_norm"].str.contains("CHICLAYO220", na=False)
+        | dfx["Barra_norm"].str.contains(r"CHICLAYO220K?V?", na=False)
     )
-    filtered = out[mask].copy()
+    filtered = dfx[mask].copy()
     if filtered.empty:
-        ejemplos = ", ".join(out["Barra"].dropna().astype(str).unique()[:10])
-        raise RuntimeError(f"No se halló la barra '{BARRA_BUSCADA}' en el Excel. Ejemplos: {ejemplos}")
+        ejemplos = ", ".join(dfx["Barra"].dropna().astype(str).unique()[:10])
+        raise RuntimeError(f"No se halló la barra '{barra_objetivo}' en el Excel. Ejemplos: {ejemplos}")
 
-    # Elegir la marca de tiempo más cercana hacia atrás a ahora
     now_lima = datetime.now(TZ)
     filtered = filtered.sort_values("ts")
     prev = filtered[filtered["ts"] <= now_lima]
     elegido = prev.iloc[-1] if not prev.empty else filtered.iloc[-1]
 
+    energia = float(elegido["CM_Energia"]) if "CM_Energia" in filtered.columns else None
+    congestion = float(elegido["CM_Congestion"]) if "CM_Congestion" in filtered.columns else None
+    total = float(elegido["CM_Total"]) if "CM_Total" in filtered.columns else None
+
     return {
         "barra": str(elegido["Barra"]),
         "ts": elegido["ts"],
-        "energia": float(elegido["CM_Energia"]) if "CM_Energia" in filtered.columns else None,
-        "congestion": float(elegido["CM_Congestion"]) if "CM_Congestion" in filtered.columns else None,
-        "total": float(elegido["CM_Total"]) if "CM_Total" in filtered.columns else None,
+        "energia": energia,
+        "congestion": congestion,
+        "total": total,
     }
 
-# ==================== NAVEGACIÓN (EXPORTAR MASIVO) ====================
+def leer_excel_local_o_bytes(binary_or_path):
+    df = _parse_excel_like(binary_or_path)
+    return _pick_record(df, BARRA_BUSCADA)
 
-def obtener_ultimo_costo_por_export(timeout_ms=120000):
+# ==================== NAVEGACIÓN (Plan B) ====================
+
+def _screenshot(page, name):
+    try: page.screenshot(path=name)
+    except Exception: pass
+
+def obtener_ultimo_costo_via_web(timeout_ms=120000):
     """
-    Flujo:
-      - Cerrar modal "Aviso".
-      - Click "Exportar Masivo".
-      - Completar 'Fecha desde' y 'Hasta' con HOY (dd/mm/yyyy).
-      - Click Aceptar y capturar el Excel en memoria.
-      - Parsear y devolver dict con {barra, ts, energia, congestion, total}.
-    Además, guarda step*.png para debug.
+    Intenta:
+      - Cerrar 'Aviso'.
+      - Click 'Exportar Masivo'.
+      - Si aparece modal, intentar aceptar; si encuentro inputs, los lleno con HOY.
+      - Capturar la descarga y parsear Excel.
     """
-
-    def _screenshot(page, name):
-        try: page.screenshot(path=name)
-        except Exception: pass
-
     today_str = datetime.now(TZ).strftime("%d/%m/%Y")
 
     with sync_playwright() as p:
@@ -279,7 +294,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
 
         # Cerrar aviso si aparece
         try:
-            page.get_by_role("button", name=re.compile(r"^Aceptar$", re.I)).click(timeout=3000)
+            page.get_by_role("button", name=re.compile(r"^Aceptar$", re.I)).click(timeout=2500)
         except Exception:
             try:
                 page.get_by_text(re.compile(r"Aceptar", re.I)).first.click(timeout=1500)
@@ -294,7 +309,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
             page.get_by_text(re.compile(r"Exportar\s*Masivo", re.I)).first.click(timeout=6000)
         _screenshot(page, "step3_open_export_modal.png")
 
-        # Intentar ubicar el contenedor del modal y los inputs
+        # Tratar de encontrar el modal (pero si no, igual probamos el click Aceptar global)
         modal = None
         for sel in [
             "xpath=//*[contains(.,'Exportar Datos')]/ancestor::div[contains(@class,'modal')][1]",
@@ -307,74 +322,40 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
                     break
             except Exception:
                 pass
-        if not modal:
-            # fallback: usar el último modal visible en el DOM
-            try:
-                all_modals = page.locator("div.modal, div[role='dialog']")
-                if all_modals.count() > 0:
-                    modal = all_modals.last
-            except Exception:
-                pass
 
-        if not modal:
-            browser.close()
-            raise RuntimeError("No se pudo localizar el modal de 'Exportar Datos'.")
-
-        # Buscar inputs dentro del modal
-        inputs = []
+        # Intentar llenar fechas si encuentro inputs; si no, seguimos
         try:
-            # priorizar inputs cercanos a los textos 'Fecha desde' y 'Hasta'
-            for label_txt in ["Fecha desde", "Desde", "Hasta"]:
+            cont = modal if modal else page
+            fields = []
+            for label in ["Fecha desde", "Desde", "Hasta"]:
                 try:
-                    lbl = modal.get_by_text(re.compile(label_txt, re.I)).first
-                    if lbl:
-                        candidate = lbl.locator("xpath=following::input[1]")
-                        if candidate.count() > 0:
-                            inputs.append(candidate.first)
+                    lbl = cont.get_by_text(re.compile(label, re.I)).first
+                    candidate = lbl.locator("xpath=following::input[1]")
+                    if candidate.count() > 0 and candidate.first.is_visible():
+                        fields.append(candidate.first)
                 except Exception:
                     pass
-            # completar con todos los inputs si no se encontraron suficientes
-            if len(inputs) < 2:
-                extra = modal.locator("input")
-                for i in range(min(extra.count(), 4)):
-                    el = extra.nth(i)
-                    if el not in inputs:
-                        inputs.append(el)
+            # completar dos primeros si los hay
+            for el in fields[:2]:
+                try:
+                    el.click(); el.fill(""); el.type(today_str, delay=15)
+                except Exception:
+                    pass
+            _screenshot(page, "step4_modal_filled.png")
         except Exception:
             pass
 
-        # Filtrar únicos visibles y tomar los dos primeros
-        vis = []
-        for el in inputs:
-            try:
-                if el.is_visible():
-                    vis.append(el)
-            except Exception:
-                continue
-        inputs = vis[:2]
-
-        if len(inputs) < 2:
-            browser.close()
-            raise RuntimeError("No se encontraron campos 'Fecha desde/Hasta' en el modal de exportación.")
-
-        # Completar ambas fechas (dd/mm/yyyy)
-        for el in inputs:
-            try:
-                el.click()
-                el.fill("")
-                el.type(today_str, delay=15)
-            except Exception:
-                pass
-        _screenshot(page, "step4_modal_filled.png")
-
-        # Capturar descarga
+        # Descargar
         binary = None
         with page.expect_download(timeout=20000) as dl_info:
-            # Botón Aceptar del modal
             try:
-                modal.get_by_role("button", name=re.compile(r"Aceptar", re.I)).click(timeout=4000)
+                if modal:
+                    modal.get_by_role("button", name=re.compile(r"Aceptar", re.I)).click(timeout=4000)
+                else:
+                    page.get_by_role("button", name=re.compile(r"Aceptar", re.I)).click(timeout=4000)
             except Exception:
-                modal.get_by_text(re.compile(r"Aceptar", re.I)).first.click(timeout=4000)
+                page.get_by_text(re.compile(r"Aceptar", re.I)).last.click(timeout=4000)
+
         download = dl_info.value
         try:
             tmp_path = "export_debug.xlsx"
@@ -382,7 +363,6 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
             with open(tmp_path, "rb") as f:
                 binary = f.read()
         except Exception:
-            # Fallback a usar stream
             pth = download.path()
             with open(pth, "rb") as f:
                 binary = f.read()
@@ -392,11 +372,21 @@ def obtener_ultimo_costo_por_export(timeout_ms=120000):
 
     if not binary:
         raise RuntimeError("No se pudo capturar el archivo exportado.")
-
-    # Parsear Excel y devolver valores
-    return leer_excel_exportado_en_memoria(binary)
+    return leer_excel_local_o_bytes(binary)
 
 # ==================== LOOP / MENSAJE ====================
+
+def obtener_ultimo_costo_por_export():
+    """
+    Plan A: si existe un Excel local (EXCEL_FILE), úsalo directo.
+    Plan B: si no, intentar flujo web para exportar.
+    """
+    if EXCEL_FILE and os.path.exists(EXCEL_FILE):
+        print(f"[INFO] Usando Excel local: {EXCEL_FILE}")
+        return leer_excel_local_o_bytes(EXCEL_FILE)
+    # Si no hay Excel local, ir por web
+    print("[INFO] No hay Excel local; intentando flujo web (Exportar Masivo).")
+    return obtener_ultimo_costo_via_web()
 
 def ejecutar_iteracion():
     estado = cargar_estado()
