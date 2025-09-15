@@ -38,7 +38,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          UMBRAL_S_POR_MWH:   "0"
+          UMBRAL_S_POR_MWH:   "400"
           INTERVALO_MINUTOS:  "30"
           BARRA_BUSCADA:      "CHICLAYO 220"
           ONESHOT:            "1"
