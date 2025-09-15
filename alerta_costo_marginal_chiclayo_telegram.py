@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Alerta COES → Telegram (CHICLAYO 220)
-Flujo 2025-09:
+Flujo 2025-09 (Exportar Masivo → Excel en memoria):
 - Acepta aviso
-- Exportar Masivo → Fecha desde / Hasta = HOY
-- Captura el Excel en memoria (sin descargar a tu laptop)
-- Lee Energía / Congestión / Total para CHICLAYO 220 (soporta columnas: NOMBRE BARRA, FECHA HORA, ENERGÍA, CONGESTIÓN, TOTAL)
-- Elige la media hora más cercana hacia atrás
+- Exportar Masivo → Fecha desde/Hasta = HOY
+- Captura Excel en memoria (sin descargar en tu laptop)
+- Lee NOMBRE BARRA / FECHA HORA o (FECHA+HORA) / ENERGÍA / CONGESTIÓN / TOTAL
+- Elige media hora más cercana hacia atrás
 """
 
 import os, time, json, re, io, unicodedata
@@ -159,31 +159,53 @@ def _reshape_from_dataframe(df0: pd.DataFrame) -> pd.DataFrame | None:
     if df0 is None or df0.empty:
         return None
 
-    # mapear columnas por nombres (insensible a acentos/espacios)
+    # normalizar nombres
     cols_norm = {c: _norm_text(c) for c in df0.columns}
 
-    def _find_col_by_keywords(keywords: list[str]) -> str | None:
+    # detectar columna combinada FECHA+HORA primero
+    col_fechahora = None
+    for c, cn in cols_norm.items():
+        if ("FECHA" in cn and "HORA" in cn) or ("FECHA HORA" in cn):
+            col_fechahora = c
+            break
+
+    def _find_col_by_keywords(keywords: list[str], *, exclude: set[str] = None) -> str | None:
+        exclude = exclude or set()
         keys = [_norm_text(k) for k in keywords]
         for c, cn in cols_norm.items():
+            if c in exclude:
+                continue
             for k in keys:
                 if k in cn:
                     return c
         return None
 
-    col_barra = _find_col_by_keywords(["NOMBRE BARRA", "BARRA", "NODO", "PUNTO"])
-    col_fechahora = _find_col_by_keywords(["FECHA HORA", "FECHA-HORA", "FECHAHORA", "FECHA Y HORA"])
-    col_fecha = _find_col_by_keywords(["FECHA"])
-    col_hora  = _find_col_by_keywords(["HORA"])
+    # si no hay columna combinada, recién buscamos separadas evitando usar la combinada
+    col_fecha = None
+    col_hora  = None
+    if not col_fechahora:
+        # evitar columnas que contengan ambas palabras
+        def _is_combo(cn: str) -> bool:
+            return ("FECHA" in cn) and ("HORA" in cn)
+        excluded = {c for c, cn in cols_norm.items() if _is_combo(cn)}
+
+        col_fecha = _find_col_by_keywords(["FECHA"], exclude=excluded)
+        col_hora  = _find_col_by_keywords(["HORA"], exclude=excluded)
+
+        # si por alguna razón quedaron iguales, invalídalas (obliga a usar combinada)
+        if col_fecha and col_hora and col_fecha == col_hora:
+            col_fecha = None
+            col_hora = None
+
+    col_barra = _find_col_by_keywords(["NOMBRE BARRA", "NOMBRE DE BARRA", "BARRA", "NODO", "PUNTO"])
     col_cm_energia = _find_col_by_keywords(["CM ENERGIA", "ENERGIA", "ENERGÍA", "COSTO MARGINAL ENERGIA", "COSTO MARGINAL ENERGÍA"])
     col_cm_cong    = _find_col_by_keywords(["CM CONGESTION", "CONGESTION", "CONGESTIÓN"])
     col_cm_total   = _find_col_by_keywords(["CM TOTAL", "TOTAL", "COSTO MARGINAL TOTAL"])
 
-    # necesitamos: Barra y algún CM; y un timestamp (FechaHora o Fecha+Hora)
-    if not col_barra:
-        return None
-    if not (col_cm_total or col_cm_energia or col_cm_cong):
-        return None
-    if not (col_fechahora or (col_fecha and col_hora)):
+    # validar mínimos
+    tiene_ts = bool(col_fechahora or (col_fecha and col_hora))
+    tiene_cm = bool(col_cm_total or col_cm_energia or col_cm_cong)
+    if not col_barra or not tiene_ts or not tiene_cm:
         return None
 
     keep = [c for c in [col_barra, col_fechahora, col_fecha, col_hora, col_cm_energia, col_cm_cong, col_cm_total] if c]
@@ -206,19 +228,28 @@ def _reshape_from_dataframe(df0: pd.DataFrame) -> pd.DataFrame | None:
     # timestamp
     if "FechaHora" in df.columns:
         df["ts"] = pd.to_datetime(df["FechaHora"], dayfirst=True, errors="coerce")
-    else:
+    elif "Fecha" in df.columns and "Hora" in df.columns:
         df["ts"] = pd.to_datetime(
             df["Fecha"].astype(str).str.strip() + " " + df["Hora"].astype(str).str.strip(),
             dayfirst=True, errors="coerce"
         )
+    else:
+        # última defensa: si hay solo una de las dos, intenta parsearla igual
+        if "Fecha" in df.columns:
+            df["ts"] = pd.to_datetime(df["Fecha"], dayfirst=True, errors="coerce")
+        elif "Hora" in df.columns:
+            hoy = datetime.now(TZ).strftime("%d/%m/%Y")
+            df["ts"] = pd.to_datetime(hoy + " " + df["Hora"].astype(str), dayfirst=True, errors="coerce")
+        else:
+            return None
 
     return df.dropna(subset=["ts"])
 
 def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
     """
-    1) Intentamos directo con header=0.
-    2) Si no, detectamos fila de encabezado.
-    Soporta columnas: NOMBRE BARRA, FECHA HORA, ENERGÍA, CONGESTIÓN, TOTAL.
+    1) Intento directo con header=0.
+    2) Si no, detecta fila de encabezado.
+    Soporta columnas: NOMBRE BARRA, FECHA HORA (o FECHA+HORA), ENERGÍA, CONGESTIÓN, TOTAL.
     """
     # intento 1: header=0
     try:
@@ -231,15 +262,11 @@ def leer_excel_exportado_en_memoria(binary: bytes) -> pd.DataFrame:
 
     # intento 2: localizar encabezado internamente
     raw = pd.read_excel(io.BytesIO(binary), header=None, engine="openpyxl")
-    # buscar primera fila que contenga 'hora' y 'barra|nodo|punto'
     sraw = raw.astype(str)
     has_hora  = sraw.apply(lambda r: r.str.contains(r"\bhora\b", case=False, na=False).any(), axis=1)
     has_barra = sraw.apply(lambda r: r.str.contains(r"\b(?:barra|nodo|punto)\b", case=False, na=False).any(), axis=1)
-    idxs = sraw.index[(has_hora & has_barra)].tolist()
-    if not idxs:
-        # también podría venir 'FECHA HORA' en una sola columna
-        has_fh = sraw.apply(lambda r: r.str.contains(r"fecha\s*hora", case=False, na=False).any(), axis=1)
-        idxs = sraw.index[(has_fh)].tolist()
+    has_fh    = sraw.apply(lambda r: r.str.contains(r"fecha\s*hora", case=False, na=False).any(), axis=1)
+    idxs = sraw.index[(has_hora & has_barra) | has_fh].tolist()
     if not idxs:
         raise RuntimeError("No se encontró encabezado en el Excel exportado.")
 
@@ -271,7 +298,7 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
 
     ciudad = _norm_barra("CHICLAYO")
     candidatos = df[
-        df["Barra_norm"].str.contains(_norm_text(barra_objetivo).replace(" ", ""), na=False)
+        df["Barra_norm"].str.contains(objetivo, na=False)
         | df["Barra_norm"].str.contains(ciudad, na=False)
         | df["Barra_norm"].str.contains("CHICLAYO220", na=False)
         | df["Barra_norm"].str.contains("CHICLAYO220K?V?", na=False, regex=True)
@@ -287,17 +314,14 @@ def filtrar_barra_robusto(df: pd.DataFrame, barra_objetivo: str) -> pd.DataFrame
 # ==================== FLUJO WEB: EXPORTAR MASIVO ====================
 def obtener_ultimo_costo_por_export(timeout_ms=150_000):
     """
-    1) Abre la página y cierra el aviso.
-    2) Click en 'Exportar Masivo'.
-    3) En el modal: poner HOY en 'Fecha desde' y 'Hasta' (dd/mm/yyyy).
-    4) Click en 'Aceptar' capturando el Excel en memoria.
-    5) Parsear y elegir la media hora más cercana hacia atrás (hoy).
+    1) Abre página y cierra aviso.
+    2) 'Exportar Masivo' → Fecha desde/Hasta = HOY (dd/mm/yyyy).
+    3) Aceptar y capturar Excel en memoria.
+    4) Parsear y elegir la media hora más cercana hacia atrás (hoy).
     """
     def _screenshot(page, name):
-        try:
-            page.screenshot(path=name)
-        except Exception:
-            pass
+        try: page.screenshot(path=name)
+        except Exception: pass
 
     def _click_possibles(page, textos, timeout=7000):
         for t in textos:
@@ -326,26 +350,17 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
         return _click_possibles(page, [r"^Exportar Masivo$", "Exportar Masivo"])
 
     def _find_modal_inputs(page):
-        """
-        Busca los dos inputs del modal 'Exportar Datos' (Fecha desde / Hasta)
-        tolerando variaciones (con/sin dos puntos).
-        """
+        # Buscar inputs por label cercana (con o sin ':')
         candidatos = []
-        # por label/etiqueta cercana
         try:
             loc = page.locator("xpath=//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ','abcdefghijklmnopqrstuvwxyzáéíóú'),'fecha desde')]/following::input[1]")
-            if loc.count() > 0 and loc.first.is_visible():
-                candidatos.append(loc.first)
-        except Exception:
-            pass
+            if loc.count() > 0 and loc.first.is_visible(): candidatos.append(loc.first)
+        except Exception: pass
         try:
             loc = page.locator("xpath=//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚ','abcdefghijklmnopqrstuvwxyzáéíóú'),'hasta')]/following::input[1]")
-            if loc.count() > 0 and loc.first.is_visible():
-                candidatos.append(loc.first)
-        except Exception:
-            pass
+            if loc.count() > 0 and loc.first.is_visible(): candidatos.append(loc.first)
+        except Exception: pass
 
-        # si no encontró 2, buscar inputs visibles dentro del contenedor del modal
         if len(candidatos) < 2:
             try:
                 modal = page.locator("xpath=//*[contains(.,'Exportar Datos')]/ancestor::div[1]")
@@ -399,7 +414,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
                 pass
         _screenshot(page, "step4_dates_filled.png")
 
-        # Descargar/capturar
+        # Capturar descarga
         with page.expect_download(timeout=60_000) as dl_info:
             _click_possibles(page, [r"^Aceptar$", "Aceptar"])
         download = dl_info.value
@@ -434,11 +449,11 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
     if not binary:
         raise RuntimeError("No se pudo capturar el archivo Excel exportado.")
 
-    # ---- Parseo y selección del registro adecuado ----
+    # ---- Parseo y selección de registro ----
     df = leer_excel_exportado_en_memoria(binary)
     df = filtrar_barra_robusto(df, BARRA_BUSCADA)
 
-    # objetivo: media hora más cercana hacia atrás (hoy)
+    # media hora más cercana hacia atrás (hoy)
     ahora = datetime.now(TZ)
     target_min = (ahora.hour * 60 + ahora.minute) // 30 * 30
     target_ts = ahora.replace(hour=target_min // 60, minute=target_min % 60, second=0, microsecond=0)
@@ -449,7 +464,7 @@ def obtener_ultimo_costo_por_export(timeout_ms=150_000):
     else:
         df["ts"] = df["ts"].dt.tz_convert(TZ)
 
-    # filtrar por hoy
+    # sólo hoy
     hoy_ini = ahora.replace(hour=0, minute=0, second=0, microsecond=0)
     hoy_fin = hoy_ini + timedelta(days=1)
     dfd = df[(df["ts"] >= hoy_ini) & (df["ts"] < hoy_fin)].copy()
